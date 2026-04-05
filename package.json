@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc"
   },
-  "dependencies": {},
+  "dependencies": {
+    "tradingview-mcp": "file:./tradingview-mcp"
+  },
   "devDependencies": {
     "typescript": "^5.5.3"
   },

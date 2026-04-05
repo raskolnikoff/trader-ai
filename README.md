@@ -1,0 +1,209 @@
+# trader-ai
+
+Local-first trading assistant CLI. Fetches live chart data from TradingView,
+retrieves relevant past analysis from SQLite (RAG), and reasons with the local
+Claude CLI — no cloud APIs, no permission dialogs at runtime.
+
+---
+
+## Architecture
+
+```
+Python CLI (main.py)
+  │
+  ├── tv CLI (subprocess) ──► TradingView (CDP port 9222)
+  │     tv state / tv quote / tv ohlcv --summary / tv values / tv data lines
+  │
+  ├── SQLite (data/trader.db)
+  │     messages · analysis_results · session
+  │
+  └── claude -p (subprocess) ──► local Claude CLI (text-only reasoning)
+        Receives assembled prompt as stdin text.
+        Does NOT call any MCP tools at runtime.
+```
+
+**Claude is used only as a text reasoning engine.**
+TradingView data is collected by Python directly via the `tv` CLI.
+MCP tool registration is a one-time developer setup — never a runtime step.
+
+---
+
+## Requirements
+
+- macOS (TradingView desktop app)
+- Node.js ≥ 18
+- Python ≥ 3.11
+- Claude CLI (`claude`) installed and authenticated
+
+---
+
+## Setup
+
+### 1. Install all dependencies (one command)
+
+From the **project root**:
+
+```bash
+npm install
+```
+
+This installs `tradingview-mcp` as a local file dependency and creates
+`./node_modules/.bin/tv`. No global install. No `npm link`. No PATH changes.
+
+Verify:
+
+```bash
+npx tv --help
+```
+
+### 2. Install Python dependencies
+
+```bash
+pip install -r trader-cli/requirements.txt
+```
+
+### 3. Start TradingView with CDP enabled
+
+TradingView must be running with the remote debugging port open so the `tv`
+CLI can connect via CDP:
+
+```bash
+/Applications/TradingView.app/Contents/MacOS/TradingView \
+  --remote-debugging-port=9222
+```
+
+`dev.sh` handles this automatically (skipped if already running, and also
+auto-runs `npm install` if `node_modules/.bin/tv` is missing).
+
+### 4. (One-time) Register the MCP server with Claude
+
+This is for Claude Desktop / Claude CLI MCP integration only.
+It is **not** required at runtime and must **not** be added to any startup script.
+
+```bash
+claude mcp add --transport stdio tradingview -- \
+  node /Users/<you>/WebstormProjects/trader-ai/tradingview-mcp/src/server.js
+```
+
+---
+
+## Usage
+
+### Quick start (via dev.sh)
+
+```bash
+bash scripts/dev.sh "BTCどう？"
+```
+
+### Direct CLI commands
+
+```bash
+# Analyze with a question
+python3 trader-cli/main.py analyze "BTCどう？"
+
+# Override symbol and timeframe
+python3 trader-cli/main.py analyze "どう思う？" --symbol BTCUSDT --timeframe 1h
+
+# Show recent conversation history
+python3 trader-cli/main.py history
+
+# Search past conversations
+python3 trader-cli/main.py search "BTC"
+```
+
+### Output format
+
+Every analysis response follows this structure:
+
+```
+📊 状況       — objective market description
+💡 判断       — buy / sell / neutral in one sentence
+🧠 根拠       — up to 3 technical or fundamental reasons
+⚠️ 注意       — risks and caveats
+🎯 次に見る価格帯 — support / resistance / target zones
+```
+
+---
+
+## Data storage
+
+All conversation history and analysis summaries are stored locally in:
+
+```
+data/trader.db
+```
+
+Tables:
+
+| Table              | Purpose                                      |
+|--------------------|----------------------------------------------|
+| `messages`         | Full user / assistant conversation history   |
+| `messages_fts`     | FTS5 trigram index for keyword search        |
+| `analysis_results` | Compact summaries used for RAG retrieval     |
+| `session`          | Last-used symbol and timeframe               |
+
+---
+
+## Troubleshooting
+
+### `tv_binary_available()` returns False / no TradingView data
+
+The tv CLI could not be found. Run from the project root:
+
+```bash
+npm install
+```
+
+Then verify:
+
+```bash
+npx tv --help
+npx tv status
+npx tv quote BTCUSDT
+npx tv ohlcv --summary
+npx tv data lines
+```
+
+### `TradingView に接続できません（CDP port 9222）`
+
+TradingView is not running with the debug port. Either:
+- Use `dev.sh` which starts TradingView automatically, or
+- Launch manually: `/Applications/TradingView.app/Contents/MacOS/TradingView --remote-debugging-port=9222`
+
+### `Claude CLI not found`
+
+Install and authenticate the Claude CLI:
+```bash
+# Follow Anthropic's installation guide, then:
+claude --version
+```
+
+### Claude attempts to use MCP tools / permission dialog appears
+
+This means the prompt is asking Claude to call tools instead of analyse text.
+Ensure you are running `python3 trader-cli/main.py analyze "..."` directly,
+**not** running `claude mcp add` anywhere in your startup flow.
+
+---
+
+## Project structure
+
+```
+trader-ai/
+├── package.json        # Root package — tradingview-mcp is a file: dependency
+├── scripts/
+│   └── dev.sh          # Start TV + run CLI (daily driver; auto-runs npm install)
+├── trader-cli/
+│   ├── main.py         # CLI commands (analyze / history / search)
+│   ├── tv_client.py    # TradingView data via ./node_modules/.bin/tv (no global install)
+│   ├── claude_client.py# Claude CLI subprocess wrapper (stdin, no API key)
+│   ├── prompts.py      # Prompt assembly + intent routing
+│   ├── rag.py          # RAG retrieval with weighted scoring
+│   ├── db.py           # SQLite storage layer
+│   └── requirements.txt
+├── tradingview-mcp/    # External — do NOT modify
+├── node_modules/       # Created by npm install; contains .bin/tv
+└── data/
+    └── trader.db       # Local SQLite database
+```
+
