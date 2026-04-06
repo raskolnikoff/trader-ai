@@ -37,12 +37,68 @@ Results are informational only. This is a measurement instrument, not a signal g
 ## Usage
 
 ```bash
-# Run directly
+# Live monitor — watches Binance and measures Polymarket reaction time
 python trader-cli/contrib/polymarket_latency/detector.py
 
-# Or via the trader CLI (if integrated)
+# Or via the trader CLI
 trader latency scan
+
+# Custom threshold (trigger on 0.1% move instead of default 0.20%)
+trader latency scan --threshold 0.1
+
+# Env-var alternative
+TRADER_LATENCY_THRESHOLD=0.1 trader latency scan
 ```
+
+---
+
+## Analyze latency logs
+
+After running `scan` at least once, analyze the collected data offline:
+
+```bash
+# Via the trader CLI (recommended)
+trader latency analyze
+
+# Or run the script directly
+python trader-cli/contrib/polymarket_latency/analyze.py
+```
+
+### What it outputs
+
+```
+📊 Latency Summary
+Events: 128
+Mean:   2.14s
+p50:    1.82s
+p95:    4.76s
+Max:    7.92s
+
+📈 Direction
+UP:    2.30s
+DOWN:  1.98s
+
+⚡ Top Lagging Markets
+  [0xabc12345]  avg 3.92s  (12 events)
+  [0xdef67890]  avg 3.51s  (9 events)
+
+⏱ Frequency
+Events/hour: 24.6
+```
+
+### What the metrics mean
+
+| Metric | Description |
+|---|---|
+| Events | Total latency records in the log |
+| Mean / p50 / p95 / Max | Latency distribution across all observed reactions |
+| UP / DOWN | Mean latency split by the Binance move direction |
+| Top Lagging Markets | Markets that consistently react slowest (highest avg latency) |
+| Events/hour | How frequently significant BTC moves occur in your session |
+
+> **Interpretation note:** High latency in a market does not imply opportunity.
+> It may reflect illiquidity, low trader attention, or simply Polymarket's infrastructure.
+> These numbers are for observation only.
 
 ---
 

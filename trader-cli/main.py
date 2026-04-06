@@ -245,27 +245,41 @@ def search(
 def latency(
     action: str = typer.Argument(
         "scan",
-        help="Sub-command to run. Currently only 'scan' is supported.",
+        help="Sub-command: 'scan' (live monitor) or 'analyze' (read log stats).",
     ),
     threshold: Optional[float] = typer.Option(
         None,
         "--threshold",
         help=(
             "BTC move %% that triggers Polymarket tracking "
-            "(default: 0.20, env: TRADER_LATENCY_THRESHOLD)."
+            "(default: 0.20, env: TRADER_LATENCY_THRESHOLD). "
+            "Only applies to the 'scan' sub-command."
         ),
     ),
 ) -> None:
     """
-    [Experimental] Measure latency between Binance BTC moves and Polymarket reactions.
+    [Experimental] Polymarket vs Binance latency tools.
+
+    Sub-commands:
+      scan     – Live monitor. Detects BTC moves and measures Polymarket reaction time.
+      analyze  – Offline report. Reads data/latency.jsonl and prints summary statistics.
 
     This is an observation tool, NOT a trading strategy.
     """
-    if action != "scan":
-        console.print(f"[red]Unknown latency sub-command: '{action}'. Use 'scan'.[/red]")
+    if action == "scan":
+        _run_latency_scan(threshold)
+    elif action == "analyze":
+        _run_latency_analyze()
+    else:
+        console.print(
+            f"[red]Unknown latency sub-command: '{action}'. "
+            "Use 'scan' or 'analyze'.[/red]"
+        )
         raise typer.Exit(code=1)
 
-    # Import here so the contrib module is optional (no hard dependency)
+
+def _run_latency_scan(threshold: Optional[float]) -> None:
+    """Start the live Binance → Polymarket latency monitor."""
     try:
         from contrib.polymarket_latency.detector import run_scan
     except ImportError as exc:
@@ -289,6 +303,25 @@ def latency(
     except Exception as exc:
         console.print(f"[red]❌ スキャン中にエラーが発生しました: {exc}[/red]")
         raise typer.Exit(code=1)
+
+
+def _run_latency_analyze() -> None:
+    """Read data/latency.jsonl and print summary statistics."""
+    try:
+        from contrib.polymarket_latency.analyze import run_analysis
+    except ImportError as exc:
+        console.print(f"[red]❌ analyze モジュールのロードに失敗しました: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    report = run_analysis()
+    console.print(
+        Panel(
+            report,
+            title="[bold cyan]Polymarket Latency Analysis[/bold cyan]",
+            border_style="cyan",
+            expand=False,
+        )
+    )
 
 
 if __name__ == "__main__":
