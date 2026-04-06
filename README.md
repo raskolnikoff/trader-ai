@@ -15,7 +15,7 @@ pip install -r trader-cli/requirements.txt
 ./scripts/trader.sh latency scan         # live Binance → Polymarket monitor
 ./scripts/trader.sh latency analyze      # summary stats from saved log
 ./scripts/trader.sh latency candidates   # markets with consistent lag
-./scripts/trader.sh analyze "BTCどう？"  # AI analysis via Claude
+./scripts/trader.sh analyze "What is BTC doing?"  # AI analysis via Claude
 ```
 
 ---
@@ -107,7 +107,7 @@ claude mcp add --transport stdio tradingview -- \
 
 ```bash
 # Recommended — works from the project root, no PATH setup needed
-./scripts/trader.sh analyze "BTCどう？"
+./scripts/trader.sh analyze "What is BTC doing?"
 ./scripts/trader.sh latency scan
 ./scripts/trader.sh latency analyze
 ./scripts/trader.sh latency candidates
@@ -119,7 +119,7 @@ claude mcp add --transport stdio tradingview -- \
 >
 > ```bash
 > # Direct Python — useful when debugging imports or the venv
-> python3 trader-cli/main.py analyze "BTCどう？"
+> python3 trader-cli/main.py analyze "What is BTC doing?"
 >
 > # Via node_modules/.bin — created automatically by `npm install`
 > ./node_modules/.bin/trader latency scan
@@ -128,17 +128,17 @@ claude mcp add --transport stdio tradingview -- \
 ### Quick start (via dev.sh)
 
 ```bash
-bash scripts/dev.sh "BTCどう？"
+bash scripts/dev.sh "What is BTC doing?"
 ```
 
 ### Direct CLI commands
 
 ```bash
 # Analyze with a question
-python3 trader-cli/main.py analyze "BTCどう？"
+python3 trader-cli/main.py analyze "What is BTC doing?"
 
 # Override symbol and timeframe
-python3 trader-cli/main.py analyze "どう思う？" --symbol BTCUSDT --timeframe 1h
+python3 trader-cli/main.py analyze "What do you think?" --symbol BTCUSDT --timeframe 1h
 
 # Show recent conversation history
 python3 trader-cli/main.py history
@@ -152,11 +152,11 @@ python3 trader-cli/main.py search "BTC"
 Every analysis response follows this structure:
 
 ```
-📊 状況       — objective market description
-💡 判断       — buy / sell / neutral in one sentence
-🧠 根拠       — up to 3 technical or fundamental reasons
-⚠️ 注意       — risks and caveats
-🎯 次に見る価格帯 — support / resistance / target zones
+📊 Status      — objective market description
+💡 Assessment  — buy / sell / neutral in one sentence
+🧠 Rationale   — up to 3 technical or fundamental reasons
+⚠️ Caution     — risks and caveats
+🎯 Key levels  — support / resistance / target zones
 ```
 
 ---
@@ -200,7 +200,7 @@ npx tv ohlcv --summary
 npx tv data lines
 ```
 
-### `TradingView に接続できません（CDP port 9222）`
+### `Cannot connect to TradingView (CDP port 9222)`
 
 TradingView is not running with the debug port. Either:
 - Use `dev.sh` which starts TradingView automatically, or

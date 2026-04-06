@@ -38,7 +38,7 @@ def initialize_db() -> None:
         """)
 
         # FTS5 virtual table using the trigram tokenizer so that mixed
-        # Latin/CJK text (e.g. "BTCどう？") is matched correctly without
+        # text (e.g. "What is BTC doing?") is matched correctly without
         # depending on word-boundary tokenisation.
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts

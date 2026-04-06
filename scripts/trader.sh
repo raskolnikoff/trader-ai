@@ -2,7 +2,7 @@
 # trader.sh — run the trader CLI without a global install.
 #
 # Usage (from the project root):
-#   ./scripts/trader.sh analyze "BTCどう？"
+#   ./scripts/trader.sh analyze "What is BTC doing?"
 #   ./scripts/trader.sh latency scan
 #   ./scripts/trader.sh latency analyze
 #   ./scripts/trader.sh latency candidates --threshold 0.1

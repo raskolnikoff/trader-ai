@@ -165,15 +165,15 @@ A market seen once with a 10 s lag scores lower than one seen 20 times with 4 s 
 ## Example output
 
 ```
-🔍 Binance BTC 価格を監視中...
-   移動閾値: 0.20%  / 追跡ウィンドウ: 60s
+🔍 Monitoring Binance BTC price...
+   Trigger threshold: 0.20%  /  Tracking window: 60s
 
-  初期 BTC 価格: $83,412.00
+  Initial BTC price: $83,412.00
 
 📡 EVENT: +0.23%
 
-  Polymarket のベースラインを取得中...
-  4 マーケットを追跡中 （最大 60s）...
+  Fetching Polymarket baseline...
+  4 markets being tracked (up to 60s)...
 
 ⚡ Lagging markets:
   📈  BTC above 85k by end of April? → 8.34s

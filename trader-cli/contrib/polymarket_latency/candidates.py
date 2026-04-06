@@ -127,11 +127,11 @@ def format_candidates(candidates: list[MarketStats]) -> str:
 
     if not candidates:
         lines.append("")
-        lines.append("  該当するマーケットがありません。")
-        lines.append(f"  フィルター基準: avg ≥ {MIN_AVG_LATENCY}s, "
+        lines.append("  No markets matched the filter criteria.")
+        lines.append(f"  Filter: avg ≥ {MIN_AVG_LATENCY}s, "
                      f"events ≥ {MIN_EVENT_COUNT}, p95 ≥ {MIN_P95_LATENCY}s")
         lines.append("")
-        lines.append("  Tip: 'trader latency scan' を実行してデータを増やしてください。")
+        lines.append("  Tip: Run 'trader latency scan' to collect more data.")
         return "\n".join(lines)
 
     for market in candidates:
@@ -164,7 +164,7 @@ def run_candidates(log_path: Path = LATENCY_LOG_PATH) -> str:
     try:
         records = load_records(log_path)
     except Exception as exc:
-        return f"❌ ログファイルの読み込みに失敗しました: {exc}"
+        return f"❌ Failed to read the log file: {exc}"
 
     market_stats = aggregate_by_market(records)
     candidates = select_candidates(market_stats)

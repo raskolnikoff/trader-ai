@@ -46,7 +46,7 @@ def _bootstrap() -> None:
     try:
         initialize_db()
     except Exception as exc:
-        console.print(f"[red]⚠️  DB の初期化に失敗しました: {exc}[/red]")
+        console.print(f"[red]⚠️  DB initialization failed: {exc}[/red]")
         raise typer.Exit(code=1)
 
 
@@ -60,17 +60,17 @@ def _validate_startup() -> bool:
     """
     if not tv_binary_available():
         console.print(
-            "[yellow]⚠️  'tv' CLI が見つかりません。"
-            "tradingview-mcp/ 内で npm link を実行してください。"
-            "（ライブデータなしで分析を続行します）[/yellow]"
+            "[yellow]⚠️  'tv' CLI not found. "
+            "Run npm install in the project root. "
+            "(Continuing without live data)[/yellow]"
         )
         return False
 
     if not check_tv_reachable():
         console.print(
-            "[yellow]⚠️  TradingView に接続できません（CDP port 9222）。"
-            "TradingView が起動しているか確認してください。"
-            "（過去の記憶のみで分析を続行します）[/yellow]"
+            "[yellow]⚠️  Cannot connect to TradingView (CDP port 9222). "
+            "Ensure TradingView is running. "
+            "(Continuing with memory only)[/yellow]"
         )
         return False
 
@@ -83,7 +83,7 @@ def _validate_startup() -> bool:
 
 @app.command()
 def analyze(
-    query: str = typer.Argument(..., help="Your question or analysis request, e.g. 'BTCどう？'"),
+    query: str = typer.Argument(..., help="Your question or analysis request, e.g. 'What is BTC doing?'"),
     symbol: Optional[str] = typer.Option(
         None, "--symbol", "-s", help="Override symbol (e.g. BTCUSDT). Saved for next run."
     ),
@@ -107,11 +107,11 @@ def analyze(
     effective_timeframe = timeframe or session.get("timeframe")
 
     # ── TradingView data (failure → empty context, never crashes) ─────────────
-    with console.status("[bold blue]📡 TradingView からデータ取得中...", spinner="dots"):
+    with console.status("[bold blue]📡 Fetching data from TradingView...", spinner="dots"):
         try:
             tv_data = collect_tv_context(symbol=effective_symbol)
         except Exception as exc:
-            console.print(f"[yellow]⚠️  TV データ取得失敗（スキップ）: {exc}[/yellow]")
+            console.print(f"[yellow]⚠️  TV data fetch failed (skipping): {exc}[/yellow]")
             tv_data = {"symbol": effective_symbol, "timeframe": effective_timeframe}
 
     # TV state takes precedence over session when available
@@ -122,20 +122,20 @@ def analyze(
     intent = detect_intent(query)
 
     # ── RAG retrieval (failure → empty lists, never crashes) ──────────────────
-    with console.status("[bold blue]🧠 過去の会話を検索中...", spinner="dots"):
+    with console.status("[bold blue]🧠 Searching conversation history...", spinner="dots"):
         try:
             recent_messages = get_recent_messages(limit=recent)
         except Exception as exc:
-            console.print(f"[yellow]⚠️  履歴取得失敗: {exc}[/yellow]")
+            console.print(f"[yellow]⚠️  Failed to retrieve history: {exc}[/yellow]")
             recent_messages = []
         try:
             relevant_messages = retrieve_relevant_messages(query, limit=relevant)
         except Exception as exc:
-            console.print(f"[yellow]⚠️  RAG 検索失敗: {exc}[/yellow]")
+            console.print(f"[yellow]⚠️  RAG search failed: {exc}[/yellow]")
             relevant_messages = []
 
     # ── Build prompt and call Claude ──────────────────────────────────────────
-    with console.status(f"[bold blue]🤖 Claude に送信中 (intent: {intent})...", spinner="dots"):
+    with console.status(f"[bold blue]🤖 Sending to Claude (intent: {intent})...", spinner="dots"):
         prompt = build_prompt(
             intent=intent,
             query=query,
@@ -146,7 +146,7 @@ def analyze(
         try:
             response = ask_claude(prompt)
         except RuntimeError as exc:
-            console.print(f"\n[red]❌ Claude エラー: {exc}[/red]")
+            console.print(f"\n[red]❌ Claude error: {exc}[/red]")
             raise typer.Exit(code=1)
 
     # ── Persist conversation + session + analysis summary ─────────────────────
@@ -158,7 +158,7 @@ def analyze(
         update_session(symbol=active_symbol, timeframe=active_timeframe)
     except Exception as exc:
         # Persistence failure must not hide the response from the user
-        console.print(f"[yellow]⚠️  保存に失敗しました（表示は継続）: {exc}[/yellow]")
+        console.print(f"[yellow]⚠️  Save failed (output still displayed): {exc}[/yellow]")
 
     # ── Render output ─────────────────────────────────────────────────────────
     symbol_label = active_symbol or "Chart"
@@ -192,10 +192,10 @@ def history(
 
     messages = get_recent_messages(limit=limit)
     if not messages:
-        console.print("[yellow]会話履歴がありません。[/yellow]")
+        console.print("[yellow]No conversation history found.[/yellow]")
         return
 
-    console.print(f"\n[bold]🗂  直近 {len(messages)} 件の会話[/bold]\n")
+    console.print(f"\n[bold]🗂  Recent {len(messages)} messages[/bold]\n")
     for msg in messages:
         role_color = "cyan" if msg["role"] == "user" else "green"
         symbol_tag = f" [{msg['symbol']}]" if msg.get("symbol") else ""
@@ -221,10 +221,10 @@ def search(
 
     results = search_messages(query, limit=limit)
     if not results:
-        console.print(f"[yellow]「{query}」に一致する会話が見つかりませんでした。[/yellow]")
+        console.print(f"[yellow]No results found for '{query}'.[/yellow]")
         return
 
-    console.print(f"\n[bold]🔍 「{query}」の検索結果（{len(results)} 件）[/bold]\n")
+    console.print(f"\n[bold]🔍 Search results for '{query}' ({len(results)} found)[/bold]\n")
     for msg in results:
         role_color = "cyan" if msg["role"] == "user" else "green"
         symbol_tag = f" [{msg['symbol']}]" if msg.get("symbol") else ""
@@ -292,14 +292,14 @@ def _run_latency_scan(threshold: Optional[float]) -> None:
     try:
         from contrib.polymarket_latency.detector import run_scan
     except ImportError as exc:
-        console.print(f"[red]❌ latency モジュールのロードに失敗しました: {exc}[/red]")
+        console.print(f"[red]❌ Failed to load latency module: {exc}[/red]")
         raise typer.Exit(code=1)
 
     console.print(
         Panel(
-            "[bold yellow]⚠️  これは実験的な観測ツールです。[/bold yellow]\n"
-            "Binance の BTC 価格変動と Polymarket の反応遅延を計測します。\n"
-            "売買シグナルではありません。",
+            "[bold yellow]⚠️  This is an experimental observation tool.[/bold yellow]\n"
+            "Measures the reaction latency of Polymarket markets to Binance BTC price moves.\n"
+            "This is NOT a trading signal.",
             title="[bold]Polymarket Latency Detector[/bold]",
             border_style="yellow",
             expand=False,
@@ -310,7 +310,7 @@ def _run_latency_scan(threshold: Optional[float]) -> None:
     try:
         run_scan(threshold=threshold)
     except Exception as exc:
-        console.print(f"[red]❌ スキャン中にエラーが発生しました: {exc}[/red]")
+        console.print(f"[red]❌ An error occurred during scan: {exc}[/red]")
         raise typer.Exit(code=1)
 
 
@@ -319,7 +319,7 @@ def _run_latency_analyze(as_json: bool = False) -> None:
     try:
         from contrib.polymarket_latency.analyze import run_analysis
     except ImportError as exc:
-        console.print(f"[red]❌ analyze モジュールのロードに失敗しました: {exc}[/red]")
+        console.print(f"[red]❌ Failed to load analyze module: {exc}[/red]")
         raise typer.Exit(code=1)
 
     report = run_analysis(as_json=as_json)
@@ -343,7 +343,7 @@ def _run_latency_candidates() -> None:
     try:
         from contrib.polymarket_latency.candidates import run_candidates
     except ImportError as exc:
-        console.print(f"[red]❌ candidates モジュールのロードに失敗しました: {exc}[/red]")
+        console.print(f"[red]❌ Failed to load candidates module: {exc}[/red]")
         raise typer.Exit(code=1)
 
     report = run_candidates()

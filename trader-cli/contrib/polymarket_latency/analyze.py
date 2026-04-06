@@ -296,7 +296,7 @@ def run_analysis(log_path: Path = LATENCY_LOG_PATH, as_json: bool = False) -> st
     except Exception as exc:
         if as_json:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
-        return f"❌ ログファイルの読み込みに失敗しました: {exc}"
+        return f"❌ Failed to read the log file: {exc}"
 
     latencies = [
         v for record in records

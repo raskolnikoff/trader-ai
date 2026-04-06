@@ -296,7 +296,7 @@ def print_event(pct_change: float) -> None:
 def print_lagging_markets(records: list[LatencyRecord]) -> None:
     top = records[:TOP_N_MARKETS]
     if not top:
-        print("  (観測ウィンドウ内に反応したマーケットはありません)")
+        print("  (No markets reacted within the observation window)")
         return
 
     print("⚡ Lagging markets:")
@@ -347,18 +347,18 @@ def run_scan(threshold: Optional[float] = None) -> None:
     """
     effective_threshold = resolve_threshold(threshold)
 
-    print("🔍 Binance BTC 価格を監視中...")
-    print(f"   移動閾値: {effective_threshold:.2f}%  / "
-          f"追跡ウィンドウ: {TRACKING_WINDOW_SECONDS:.0f}s")
-    print(f"   ログ出力先: {LATENCY_LOG_PATH}")
-    print("   Ctrl+C で終了\n")
+    print("🔍 Monitoring Binance BTC price...")
+    print(f"   Trigger threshold: {effective_threshold:.2f}%  / "
+          f"Tracking window: {TRACKING_WINDOW_SECONDS:.0f}s")
+    print(f"   Log output: {LATENCY_LOG_PATH}")
+    print("   Press Ctrl+C to stop\n")
 
     previous = fetch_binance_price()
     if previous is None:
-        print("❌ Binance に接続できません。ネットワークを確認してください。")
+        print("❌ Cannot connect to Binance. Check your network connection.")
         return
 
-    print(f"  初期 BTC 価格: ${previous:,.2f}")
+    print(f"  Initial BTC price: ${previous:,.2f}")
 
     while True:
         time.sleep(POLL_INTERVAL_SECONDS)
@@ -374,16 +374,16 @@ def run_scan(threshold: Optional[float] = None) -> None:
             binance_direction = "up" if pct_change > 0 else "down"
             print_event(pct_change)
 
-            print("  Polymarket のベースラインを取得中...")
+            print("  Fetching Polymarket baseline...")
             baseline_markets = fetch_bitcoin_markets()
 
             if not baseline_markets:
-                print("  ⚠️  Bitcoin マーケットが見つかりません。次のイベントを待ちます。\n")
+                print("  ⚠️  No Bitcoin markets found. Waiting for next event.\n")
                 previous = current_price
                 continue
 
-            print(f"  {len(baseline_markets)} マーケットを追跡中 "
-                  f"（最大 {TRACKING_WINDOW_SECONDS:.0f}s）...\n")
+            print(f"  Tracking {len(baseline_markets)} markets "
+                  f"(up to {TRACKING_WINDOW_SECONDS:.0f}s)...\n")
 
             lagging = measure_market_latency(
                 baseline_markets=baseline_markets,
@@ -422,5 +422,5 @@ if __name__ == "__main__":
     try:
         run_scan(threshold=args.threshold)
     except KeyboardInterrupt:
-        print("\n\n👋 終了しました。")
+        print("\n\n👋 Stopped.")
 
