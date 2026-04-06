@@ -247,6 +247,14 @@ def latency(
         "scan",
         help="Sub-command to run. Currently only 'scan' is supported.",
     ),
+    threshold: Optional[float] = typer.Option(
+        None,
+        "--threshold",
+        help=(
+            "BTC move %% that triggers Polymarket tracking "
+            "(default: 0.20, env: TRADER_LATENCY_THRESHOLD)."
+        ),
+    ),
 ) -> None:
     """
     [Experimental] Measure latency between Binance BTC moves and Polymarket reactions.
@@ -277,7 +285,7 @@ def latency(
     console.print()
 
     try:
-        run_scan()
+        run_scan(threshold=threshold)
     except Exception as exc:
         console.print(f"[red]❌ スキャン中にエラーが発生しました: {exc}[/red]")
         raise typer.Exit(code=1)

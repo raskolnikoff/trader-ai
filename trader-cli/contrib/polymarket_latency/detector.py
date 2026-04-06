@@ -7,25 +7,32 @@ This module measures how quickly Polymarket prediction markets react to
 Binance BTC price movements. It is NOT a trading strategy.
 
 Usage:
-    python detector.py
+    python detector.py [--threshold 0.1]
 """
 
+import os
 import time
 import urllib.request
 import urllib.error
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
-# ── Configurable thresholds ────────────────────────────────────────────────────
-BINANCE_MOVE_THRESHOLD_PCT = 0.20   # % move that counts as a "significant event"
-POLL_INTERVAL_SECONDS = 2.0         # how often to poll Binance during tracking
-TRACKING_WINDOW_SECONDS = 60.0      # how long to watch for Polymarket reaction
-TOP_N_MARKETS = 5                   # lagging markets to display
-REQUEST_TIMEOUT = 10                # HTTP timeout in seconds
+# ── Default constants (all overridable at call-site or via env) ────────────────
+DEFAULT_THRESHOLD_PCT = 0.20    # % move that counts as a "significant event"
+POLL_INTERVAL_SECONDS = 2.0     # how often to poll Binance during tracking
+TRACKING_WINDOW_SECONDS = 60.0  # how long to watch for Polymarket reaction
+TOP_N_MARKETS = 5               # lagging markets to display
+REQUEST_TIMEOUT = 10            # HTTP timeout in seconds
 
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 POLYMARKET_URL = "https://clob.polymarket.com/markets"
+
+# JSONL log lives at <project-root>/data/latency.jsonl
+_PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+LATENCY_LOG_PATH = _PROJECT_ROOT / "data" / "latency.jsonl"
 
 
 # ── Data containers ────────────────────────────────────────────────────────────
@@ -46,6 +53,7 @@ class MarketSnapshot:
 
 @dataclass
 class LatencyRecord:
+    market_id: str
     question: str
     latency_seconds: float
     direction: str   # "up" | "down" | "unclear"
@@ -174,6 +182,35 @@ def _safe_float(value) -> Optional[float]:
         return None
 
 
+# ── Persistence ────────────────────────────────────────────────────────────────
+
+def append_latency_log(records: list[LatencyRecord]) -> None:
+    """
+    Append latency records to data/latency.jsonl in the project root.
+    Each record becomes one JSON line. Fails silently so the scan loop is never interrupted.
+    """
+    if not records:
+        return
+
+    try:
+        LATENCY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+
+        with LATENCY_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            for record in records:
+                entry = {
+                    "ts": ts,
+                    "market_id": record.market_id,
+                    "question": record.question,
+                    "latency": round(record.latency_seconds, 4),
+                    "direction": record.direction,
+                }
+                log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        # Log persistence must never crash the main scan loop
+        print(f"  [log] Failed to write latency log: {exc}")
+
+
 # ── Latency detection logic ────────────────────────────────────────────────────
 
 def detect_direction_change(
@@ -238,6 +275,7 @@ def measure_market_latency(
     for market in baseline_markets:
         if market.market_id in first_reaction:
             results.append(LatencyRecord(
+                market_id=market.market_id,
                 question=market.question,
                 latency_seconds=first_reaction[market.market_id],
                 direction=direction_by_id.get(market.market_id, "unclear"),
@@ -264,21 +302,55 @@ def print_lagging_markets(records: list[LatencyRecord]) -> None:
     print("⚡ Lagging markets:")
     for record in top:
         dir_icon = "📈" if record.direction == "up" else "📉" if record.direction == "down" else "➡️"
-        question = record.question[:80]
-        print(f"  {dir_icon}  {question} → {record.latency_seconds:.2f}s")
+        # Truncate the question so the line stays readable
+        question = record.question[:60]
+        if len(record.question) > 60:
+            question += "…"
+        # Show a short prefix of the market_id (first 10 chars) for reproducibility
+        short_id = record.market_id[:10]
+        print(f"  {dir_icon}  [{short_id}] {question} → {record.latency_seconds:.2f}s")
+
+
+# ── Threshold resolution ───────────────────────────────────────────────────────
+
+def resolve_threshold(cli_value: Optional[float]) -> float:
+    """
+    Return the effective threshold in this priority order:
+      1. Value passed explicitly via CLI (cli_value)
+      2. TRADER_LATENCY_THRESHOLD environment variable
+      3. DEFAULT_THRESHOLD_PCT module constant
+    """
+    if cli_value is not None:
+        return cli_value
+
+    env_value = os.environ.get("TRADER_LATENCY_THRESHOLD")
+    if env_value is not None:
+        try:
+            return float(env_value)
+        except ValueError:
+            print(f"  [config] Invalid TRADER_LATENCY_THRESHOLD='{env_value}', using default.")
+
+    return DEFAULT_THRESHOLD_PCT
 
 
 # ── Main scan loop ─────────────────────────────────────────────────────────────
 
-def run_scan() -> None:
+def run_scan(threshold: Optional[float] = None) -> None:
     """
     Continuously poll Binance. When a significant price move is detected,
     record a baseline Polymarket snapshot and measure how long each market
     takes to reflect the move.
+
+    Args:
+        threshold: % move that triggers tracking. Falls back to the
+                   TRADER_LATENCY_THRESHOLD env var, then DEFAULT_THRESHOLD_PCT.
     """
+    effective_threshold = resolve_threshold(threshold)
+
     print("🔍 Binance BTC 価格を監視中...")
-    print(f"   移動閾値: {BINANCE_MOVE_THRESHOLD_PCT:.2f}%  / "
-          f"追跡ウィンドウ: {TRACKING_WINDOW_SECONDS:.0f}s\n")
+    print(f"   移動閾値: {effective_threshold:.2f}%  / "
+          f"追跡ウィンドウ: {TRACKING_WINDOW_SECONDS:.0f}s")
+    print(f"   ログ出力先: {LATENCY_LOG_PATH}")
     print("   Ctrl+C で終了\n")
 
     previous = fetch_binance_price()
@@ -297,7 +369,7 @@ def run_scan() -> None:
 
         pct_change = compute_pct_change(previous, current_price)
 
-        if abs(pct_change) >= BINANCE_MOVE_THRESHOLD_PCT:
+        if abs(pct_change) >= effective_threshold:
             event_time = time.time()
             binance_direction = "up" if pct_change > 0 else "down"
             print_event(pct_change)
@@ -320,6 +392,7 @@ def run_scan() -> None:
             )
 
             print_lagging_markets(lagging)
+            append_latency_log(lagging)
             print()
 
             # Reset baseline to current price after tracking completes
@@ -332,8 +405,22 @@ def run_scan() -> None:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Polymarket vs Binance latency detector")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help=(
+            f"BTC move %% that triggers tracking "
+            f"(default: {DEFAULT_THRESHOLD_PCT}, env: TRADER_LATENCY_THRESHOLD)"
+        ),
+    )
+    args = parser.parse_args()
+
     try:
-        run_scan()
+        run_scan(threshold=args.threshold)
     except KeyboardInterrupt:
         print("\n\n👋 終了しました。")
 
