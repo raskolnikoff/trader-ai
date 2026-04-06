@@ -7,7 +7,9 @@ This is a read-only, offline tool — it never fetches live data.
 
 Usage:
     python analyze.py
+    python analyze.py --json
     trader latency analyze
+    trader latency analyze --json
 """
 
 import json
@@ -191,7 +193,7 @@ def format_report(
     events_per_hour: Optional[float],
 ) -> str:
     """
-    Build the full report string.
+    Build the full human-readable report string.
     Returns a single multi-line string ready to be printed.
     """
     lines = []
@@ -240,16 +242,60 @@ def format_report(
     return "\n".join(lines)
 
 
+def format_json_report(
+    basic: dict,
+    direction_means: dict,
+    top_markets: list[dict],
+    events_per_hour: Optional[float],
+) -> str:
+    """
+    Build a machine-readable JSON string from the same computed metrics.
+    All floats are already rounded by the compute_* functions.
+    Output is a single JSON object — safe to pipe into jq or other tools.
+    """
+    payload = {
+        "events": basic["count"],
+        "latency": {
+            "mean": basic["mean"],
+            "p50":  basic["p50"],
+            "p95":  basic["p95"],
+            "max":  basic["max"],
+        },
+        "direction": {
+            "up":   direction_means.get("up"),
+            "down": direction_means.get("down"),
+        },
+        "top_markets": [
+            {
+                "market_id":   m["market_id"],
+                "avg_latency": m["avg_latency"],
+                "events":      m["count"],
+            }
+            for m in top_markets
+        ],
+        "frequency": {
+            "events_per_hour": events_per_hour,
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 # ── Public entry point ─────────────────────────────────────────────────────────
 
-def run_analysis(log_path: Path = LATENCY_LOG_PATH) -> str:
+def run_analysis(log_path: Path = LATENCY_LOG_PATH, as_json: bool = False) -> str:
     """
     Load the JSONL log, compute all metrics, and return the formatted report.
     Never raises — any internal error produces a graceful message.
+
+    Args:
+        log_path: Path to the JSONL latency log.
+        as_json:  When True, returns a JSON string instead of human-readable text.
     """
     try:
         records = load_records(log_path)
     except Exception as exc:
+        if as_json:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
         return f"❌ ログファイルの読み込みに失敗しました: {exc}"
 
     latencies = [
@@ -262,11 +308,23 @@ def run_analysis(log_path: Path = LATENCY_LOG_PATH) -> str:
     top_markets = compute_top_markets(records)
     freq = compute_events_per_hour(records)
 
+    if as_json:
+        return format_json_report(basic, direction_means, top_markets, freq)
     return format_report(basic, direction_means, top_markets, freq)
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(run_analysis())
+    import argparse
 
+    parser = argparse.ArgumentParser(description="Latency log analyzer")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Output machine-readable JSON instead of human-readable text",
+    )
+    args = parser.parse_args()
+
+    print(run_analysis(as_json=args.as_json))

@@ -50,6 +50,8 @@ try {
 }
 
 // ── Create symlink ────────────────────────────────────────────────────────────
+// TODO: consider Windows junction support if needed (fs.symlinkSync with
+//       type='junction' for directories, or a .cmd shim for executables)
 try {
   fs.symlinkSync(TARGET, LINK);
 } catch (err) {

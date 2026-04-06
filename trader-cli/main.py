@@ -245,7 +245,7 @@ def search(
 def latency(
     action: str = typer.Argument(
         "scan",
-        help="Sub-command: 'scan' (live monitor) or 'analyze' (read log stats).",
+        help="Sub-command: 'scan' (live monitor), 'analyze' (log stats), or 'candidates'.",
     ),
     threshold: Optional[float] = typer.Option(
         None,
@@ -255,6 +255,12 @@ def latency(
             "(default: 0.20, env: TRADER_LATENCY_THRESHOLD). "
             "Only applies to the 'scan' sub-command."
         ),
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        is_flag=True,
+        help="Output machine-readable JSON. Only applies to the 'analyze' sub-command.",
     ),
 ) -> None:
     """
@@ -270,7 +276,7 @@ def latency(
     if action == "scan":
         _run_latency_scan(threshold)
     elif action == "analyze":
-        _run_latency_analyze()
+        _run_latency_analyze(as_json=as_json)
     elif action == "candidates":
         _run_latency_candidates()
     else:
@@ -308,7 +314,7 @@ def _run_latency_scan(threshold: Optional[float]) -> None:
         raise typer.Exit(code=1)
 
 
-def _run_latency_analyze() -> None:
+def _run_latency_analyze(as_json: bool = False) -> None:
     """Read data/latency.jsonl and print summary statistics."""
     try:
         from contrib.polymarket_latency.analyze import run_analysis
@@ -316,15 +322,20 @@ def _run_latency_analyze() -> None:
         console.print(f"[red]❌ analyze モジュールのロードに失敗しました: {exc}[/red]")
         raise typer.Exit(code=1)
 
-    report = run_analysis()
-    console.print(
-        Panel(
-            report,
-            title="[bold cyan]Polymarket Latency Analysis[/bold cyan]",
-            border_style="cyan",
-            expand=False,
+    report = run_analysis(as_json=as_json)
+
+    if as_json:
+        # Raw JSON must reach stdout undecorated — no Rich panel, no colour codes
+        print(report)
+    else:
+        console.print(
+            Panel(
+                report,
+                title="[bold cyan]Polymarket Latency Analysis[/bold cyan]",
+                border_style="cyan",
+                expand=False,
+            )
         )
-    )
 
 
 def _run_latency_candidates() -> None:

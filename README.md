@@ -6,6 +6,20 @@ Claude CLI — no cloud APIs, no permission dialogs at runtime.
 
 ---
 
+## ⚡ Quick Start
+
+```bash
+npm install                              # installs deps + links trader CLI
+pip install -r trader-cli/requirements.txt
+
+./scripts/trader.sh latency scan         # live Binance → Polymarket monitor
+./scripts/trader.sh latency analyze      # summary stats from saved log
+./scripts/trader.sh latency candidates   # markets with consistent lag
+./scripts/trader.sh analyze "BTCどう？"  # AI analysis via Claude
+```
+
+---
+
 ## Architecture
 
 ```
