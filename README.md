@@ -89,6 +89,37 @@ claude mcp add --transport stdio tradingview -- \
 
 ## Usage
 
+### Run CLI
+
+No global install required. Three equivalent ways to invoke the CLI:
+
+**Option 1 — helper script (recommended):**
+
+```bash
+./scripts/trader.sh analyze "BTCどう？"
+./scripts/trader.sh latency scan
+./scripts/trader.sh latency analyze
+./scripts/trader.sh latency candidates
+./scripts/trader.sh history
+./scripts/trader.sh search "BTC"
+```
+
+**Option 2 — python3 directly:**
+
+```bash
+python3 trader-cli/main.py analyze "BTCどう？"
+python3 trader-cli/main.py latency scan --threshold 0.1
+```
+
+**Option 3 — via `./node_modules/.bin/` (created automatically by `npm install`):**
+
+```bash
+./node_modules/.bin/trader latency scan
+./node_modules/.bin/trader analyze "BTCどう？"
+```
+
+> All three options are equivalent. None require a global install or `npm link`.
+
 ### Quick start (via dev.sh)
 
 ```bash
@@ -190,20 +221,28 @@ Ensure you are running `python3 trader-cli/main.py analyze "..."` directly,
 
 ```
 trader-ai/
-├── package.json        # Root package — tradingview-mcp is a file: dependency
+├── package.json        # Root package — tradingview-mcp + postinstall that links trader bin
 ├── scripts/
-│   └── dev.sh          # Start TV + run CLI (daily driver; auto-runs npm install)
+│   ├── dev.sh          # Start TV + run CLI (daily driver; auto-runs npm install)
+│   └── trader.sh       # Thin wrapper: python3 trader-cli/main.py "$@"
 ├── trader-cli/
-│   ├── main.py         # CLI commands (analyze / history / search)
+│   ├── main.py         # CLI entry point — executable (chmod +x)
+│   ├── package.json    # bin: { trader: ./main.py } declaration
 │   ├── tv_client.py    # TradingView data via ./node_modules/.bin/tv (no global install)
 │   ├── claude_client.py# Claude CLI subprocess wrapper (stdin, no API key)
 │   ├── prompts.py      # Prompt assembly + intent routing
 │   ├── rag.py          # RAG retrieval with weighted scoring
 │   ├── db.py           # SQLite storage layer
-│   └── requirements.txt
+│   ├── requirements.txt
+│   └── contrib/
+│       └── polymarket_latency/   # Experimental latency measurement tools
+│           ├── detector.py       # Live Binance → Polymarket latency scanner
+│           ├── analyze.py        # Offline summary stats from latency.jsonl
+│           └── candidates.py     # Filters markets with consistent lag
 ├── tradingview-mcp/    # External — do NOT modify
-├── node_modules/       # Created by npm install; contains .bin/tv
+├── node_modules/       # Created by npm install; contains .bin/tv and .bin/trader
 └── data/
-    └── trader.db       # Local SQLite database
+    ├── trader.db       # Local SQLite database
+    └── latency.jsonl   # Append-only latency event log (created by detector.py)
 ```
 

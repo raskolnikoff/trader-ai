@@ -4,7 +4,8 @@
   "description": "",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "postinstall": "chmod +x trader-cli/main.py && mkdir -p node_modules/.bin && ln -sf \"$(pwd)/trader-cli/main.py\" node_modules/.bin/trader && echo '✅ trader CLI linked → node_modules/.bin/trader'"
   },
   "dependencies": {
     "tradingview-mcp": "file:./tradingview-mcp"
