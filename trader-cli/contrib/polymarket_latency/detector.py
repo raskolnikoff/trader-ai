@@ -66,11 +66,25 @@ class LatencyRecord:
 # ── HTTP helpers ───────────────────────────────────────────────────────────────
 
 def _fetch_json(url: str) -> Optional[dict | list]:
-    """Fetch JSON from a URL. Returns None on any error so callers degrade gracefully."""
+    """
+    Fetch JSON from a URL. Returns None on any error so callers degrade gracefully.
+
+    Sends browser-like headers so APIs that block bare urllib requests (e.g.
+    Polymarket returning 403 Forbidden) respond normally.
+    """
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; trader-ai/1.0)",
+            "Accept": "application/json",
+        },
+    )
     try:
-        with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             raw = response.read().decode("utf-8")
             return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        print(f"  [http]    HTTP {exc.code} {exc.reason} — {url}")
     except urllib.error.URLError as exc:
         print(f"  [network] Cannot reach {url}: {exc.reason}")
     except json.JSONDecodeError as exc:
