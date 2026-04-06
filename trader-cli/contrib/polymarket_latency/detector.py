@@ -30,6 +30,10 @@ REQUEST_TIMEOUT = 10            # HTTP timeout in seconds
 BINANCE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 POLYMARKET_URL = "https://clob.polymarket.com/markets"
 
+# Loose keyword filter — lowercase, matched against the market question field.
+# Keeping this broad ensures we don't silently drop real BTC markets.
+BTC_KEYWORDS = ["bitcoin", "btc"]
+
 # JSONL log lives at <project-root>/data/latency.jsonl
 _PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 LATENCY_LOG_PATH = _PROJECT_ROOT / "data" / "latency.jsonl"
@@ -99,23 +103,44 @@ def compute_pct_change(old_price: float, new_price: float) -> float:
 
 # ── Polymarket helpers ─────────────────────────────────────────────────────────
 
-def fetch_bitcoin_markets() -> list[MarketSnapshot]:
+def fetch_bitcoin_markets(verbose: bool = False) -> list[MarketSnapshot]:
     """
-    Fetch active Polymarket markets that mention 'bitcoin' in their question.
-    Computes mid price from bestBid / bestAsk when available.
-    Returns an empty list on any failure.
+    Fetch active Polymarket markets whose question mentions 'bitcoin' or 'btc'.
+
+    Args:
+        verbose: When True, print diagnostic info about the raw API response
+                 and show up to 3 sample markets. Use this for the initial
+                 baseline fetch; leave False during polling to avoid noise.
+
+    Mid price is computed from bestBid/bestAsk when available.
+    Markets where mid price cannot be computed fall back to 0.5 (neutral
+    probability) so they still appear in the tracking window rather than
+    being silently dropped.
+
+    Returns an empty list only on network/parse failure.
     """
     data = _fetch_json(POLYMARKET_URL)
     if data is None:
         return []
 
-    # The CLOB API returns either a list directly or a dict with a "data" key
+    # The CLOB API returns either a list directly or {"data": [...], "next_cursor": ...}
     if isinstance(data, dict):
         markets_raw = data.get("data", [])
     elif isinstance(data, list):
         markets_raw = data
     else:
+        print(f"  [polymarket] Unexpected response type: {type(data).__name__}")
         return []
+
+    if verbose:
+        print(f"  [polymarket] Total markets in API response: {len(markets_raw)}")
+        if markets_raw:
+            print("  [polymarket] Sample markets (first 3):")
+            for sample in markets_raw[:3]:
+                if isinstance(sample, dict):
+                    raw_id = sample.get("condition_id") or sample.get("id", "?")
+                    question = sample.get("question", "")[:70]
+                    print(f"    id={str(raw_id)[:14]}  q={question!r}")
 
     snapshots: list[MarketSnapshot] = []
     now = time.time()
@@ -125,12 +150,16 @@ def fetch_bitcoin_markets() -> list[MarketSnapshot]:
             continue
 
         question = market.get("question", "")
-        if "bitcoin" not in question.lower():
+
+        # Loose filter: match "bitcoin" OR "btc" (case-insensitive)
+        if not any(kw in question.lower() for kw in BTC_KEYWORDS):
             continue
 
+        # Try to compute mid price; fall back to neutral 0.5 so the market
+        # stays in the tracking window even when bid/ask data is absent.
         mid_price = _compute_mid_price(market)
         if mid_price is None:
-            continue
+            mid_price = 0.5
 
         market_id = market.get("condition_id") or market.get("id") or question[:40]
         snapshots.append(MarketSnapshot(
@@ -139,6 +168,21 @@ def fetch_bitcoin_markets() -> list[MarketSnapshot]:
             mid_price=mid_price,
             timestamp=now,
         ))
+
+    if verbose:
+        if snapshots:
+            print(f"  [polymarket] BTC/Bitcoin markets matched: {len(snapshots)}")
+        else:
+            print("  [polymarket] ⚠️  No BTC/Bitcoin markets found after filtering.")
+            print("  [polymarket] Full response preview (first 5 items):")
+            try:
+                preview = json.dumps(markets_raw[:5], ensure_ascii=False, indent=2)
+                # Cap at 2000 chars so the terminal stays readable
+                print(preview[:2000])
+                if len(preview) > 2000:
+                    print("  ... (truncated)")
+            except Exception as exc:
+                print(f"  (could not serialize response: {exc})")
 
     return snapshots
 
@@ -375,7 +419,7 @@ def run_scan(threshold: Optional[float] = None) -> None:
             print_event(pct_change)
 
             print("  Fetching Polymarket baseline...")
-            baseline_markets = fetch_bitcoin_markets()
+            baseline_markets = fetch_bitcoin_markets(verbose=True)
 
             if not baseline_markets:
                 print("  ⚠️  No Bitcoin markets found. Waiting for next event.\n")
