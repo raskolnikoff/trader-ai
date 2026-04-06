@@ -237,5 +237,51 @@ def search(
         console.print()
 
 
+# ---------------------------------------------------------------------------
+# latency
+# ---------------------------------------------------------------------------
+
+@app.command()
+def latency(
+    action: str = typer.Argument(
+        "scan",
+        help="Sub-command to run. Currently only 'scan' is supported.",
+    ),
+) -> None:
+    """
+    [Experimental] Measure latency between Binance BTC moves and Polymarket reactions.
+
+    This is an observation tool, NOT a trading strategy.
+    """
+    if action != "scan":
+        console.print(f"[red]Unknown latency sub-command: '{action}'. Use 'scan'.[/red]")
+        raise typer.Exit(code=1)
+
+    # Import here so the contrib module is optional (no hard dependency)
+    try:
+        from contrib.polymarket_latency.detector import run_scan
+    except ImportError as exc:
+        console.print(f"[red]❌ latency モジュールのロードに失敗しました: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(
+        Panel(
+            "[bold yellow]⚠️  これは実験的な観測ツールです。[/bold yellow]\n"
+            "Binance の BTC 価格変動と Polymarket の反応遅延を計測します。\n"
+            "売買シグナルではありません。",
+            title="[bold]Polymarket Latency Detector[/bold]",
+            border_style="yellow",
+            expand=False,
+        )
+    )
+    console.print()
+
+    try:
+        run_scan()
+    except Exception as exc:
+        console.print(f"[red]❌ スキャン中にエラーが発生しました: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+
 if __name__ == "__main__":
     app()
