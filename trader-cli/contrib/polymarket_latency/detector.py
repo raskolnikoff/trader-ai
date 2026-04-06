@@ -246,6 +246,9 @@ def append_latency_log(records: list[LatencyRecord]) -> None:
     """
     Append latency records to data/latency.jsonl in the project root.
     Each record becomes one JSON line. Fails silently so the scan loop is never interrupted.
+
+    This function is unchanged from the original — it only writes when records
+    is non-empty. Use append_zero_reaction_event() for zero-reaction events.
     """
     if not records:
         return
@@ -267,6 +270,32 @@ def append_latency_log(records: list[LatencyRecord]) -> None:
     except Exception as exc:
         # Log persistence must never crash the main scan loop
         print(f"  [log] Failed to write latency log: {exc}")
+
+
+def append_zero_reaction_event(markets_tracked: int) -> None:
+    """
+    Write a single sentinel line recording that a Binance event fired but no
+    Polymarket market reacted within the tracking window.
+
+    This allows offline analysis to distinguish:
+      - "event with zero reactions"   → {"event": true, "reacted": 0, ...}
+      - "system/network failure"      → gap in the log with no entry at all
+
+    Only called when run_scan() is started with log_all=True.
+    Fails silently so the scan loop is never interrupted.
+    """
+    try:
+        LATENCY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": True,
+            "reacted": 0,
+            "markets_tracked": markets_tracked,
+        }
+        with LATENCY_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"  [log] Failed to write zero-reaction event: {exc}")
 
 
 # ── Latency detection logic ────────────────────────────────────────────────────
@@ -393,7 +422,7 @@ def resolve_threshold(cli_value: Optional[float]) -> float:
 
 # ── Main scan loop ─────────────────────────────────────────────────────────────
 
-def run_scan(threshold: Optional[float] = None) -> None:
+def run_scan(threshold: Optional[float] = None, log_all: bool = False) -> None:
     """
     Continuously poll Binance. When a significant price move is detected,
     record a baseline Polymarket snapshot and measure how long each market
@@ -402,6 +431,9 @@ def run_scan(threshold: Optional[float] = None) -> None:
     Args:
         threshold: % move that triggers tracking. Falls back to the
                    TRADER_LATENCY_THRESHOLD env var, then DEFAULT_THRESHOLD_PCT.
+        log_all:   When True, write a zero-reaction sentinel line to the JSONL
+                   log whenever an event fires but no market reacts within the
+                   tracking window. Defaults to False for backward compatibility.
     """
     effective_threshold = resolve_threshold(threshold)
 
@@ -409,6 +441,7 @@ def run_scan(threshold: Optional[float] = None) -> None:
     print(f"   Trigger threshold: {effective_threshold:.2f}%  / "
           f"Tracking window: {TRACKING_WINDOW_SECONDS:.0f}s")
     print(f"   Log output: {LATENCY_LOG_PATH}")
+    print(f"   Log all events (--log-all): {log_all}")
     print("   Press Ctrl+C to stop\n")
 
     previous = fetch_binance_price()
@@ -451,6 +484,13 @@ def run_scan(threshold: Optional[float] = None) -> None:
 
             print_lagging_markets(lagging)
             append_latency_log(lagging)
+
+            # When --log-all is set, record zero-reaction events so the log
+            # can distinguish "nothing moved" from "nothing was tracked".
+            if not lagging and log_all:
+                append_zero_reaction_event(markets_tracked=len(baseline_markets))
+                print(f"  [log] Zero-reaction event recorded ({len(baseline_markets)} markets tracked).")
+
             print()
 
             # Reset baseline to current price after tracking completes
@@ -475,10 +515,20 @@ if __name__ == "__main__":
             f"(default: {DEFAULT_THRESHOLD_PCT}, env: TRADER_LATENCY_THRESHOLD)"
         ),
     )
+    parser.add_argument(
+        "--log-all",
+        action="store_true",
+        default=False,
+        help=(
+            "Log a sentinel entry when an event fires but no market reacts. "
+            "Allows downstream analysis to distinguish zero-reaction events "
+            "from system failures. Default: off (only log reacting markets)."
+        ),
+    )
     args = parser.parse_args()
 
     try:
-        run_scan(threshold=args.threshold)
+        run_scan(threshold=args.threshold, log_all=args.log_all)
     except KeyboardInterrupt:
         print("\n\n👋 Stopped.")
 

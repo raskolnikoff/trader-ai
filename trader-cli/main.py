@@ -262,6 +262,16 @@ def latency(
         is_flag=True,
         help="Output machine-readable JSON. Only applies to the 'analyze' sub-command.",
     ),
+    log_all: bool = typer.Option(
+        False,
+        "--log-all",
+        is_flag=True,
+        help=(
+            "Log a sentinel entry when an event fires but no market reacts. "
+            "Helps distinguish zero-reaction events from system failures in latency.jsonl. "
+            "Only applies to the 'scan' sub-command."
+        ),
+    ),
 ) -> None:
     """
     [Experimental] Polymarket vs Binance latency tools.
@@ -274,7 +284,7 @@ def latency(
     This is an observation tool, NOT a trading strategy.
     """
     if action == "scan":
-        _run_latency_scan(threshold)
+        _run_latency_scan(threshold, log_all=log_all)
     elif action == "analyze":
         _run_latency_analyze(as_json=as_json)
     elif action == "candidates":
@@ -287,7 +297,7 @@ def latency(
         raise typer.Exit(code=1)
 
 
-def _run_latency_scan(threshold: Optional[float]) -> None:
+def _run_latency_scan(threshold: Optional[float], log_all: bool = False) -> None:
     """Start the live Binance → Polymarket latency monitor."""
     try:
         from contrib.polymarket_latency.detector import run_scan
@@ -308,7 +318,7 @@ def _run_latency_scan(threshold: Optional[float]) -> None:
     console.print()
 
     try:
-        run_scan(threshold=threshold)
+        run_scan(threshold=threshold, log_all=log_all)
     except Exception as exc:
         console.print(f"[red]❌ An error occurred during scan: {exc}[/red]")
         raise typer.Exit(code=1)
