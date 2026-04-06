@@ -91,11 +91,8 @@ claude mcp add --transport stdio tradingview -- \
 
 ### Run CLI
 
-No global install required. Three equivalent ways to invoke the CLI:
-
-**Option 1 — helper script (recommended):**
-
 ```bash
+# Recommended — works from the project root, no PATH setup needed
 ./scripts/trader.sh analyze "BTCどう？"
 ./scripts/trader.sh latency scan
 ./scripts/trader.sh latency analyze
@@ -104,21 +101,15 @@ No global install required. Three equivalent ways to invoke the CLI:
 ./scripts/trader.sh search "BTC"
 ```
 
-**Option 2 — python3 directly:**
-
-```bash
-python3 trader-cli/main.py analyze "BTCどう？"
-python3 trader-cli/main.py latency scan --threshold 0.1
-```
-
-**Option 3 — via `./node_modules/.bin/` (created automatically by `npm install`):**
-
-```bash
-./node_modules/.bin/trader latency scan
-./node_modules/.bin/trader analyze "BTCどう？"
-```
-
-> All three options are equivalent. None require a global install or `npm link`.
+> **Alternative / debug options** (both are equivalent to the above):
+>
+> ```bash
+> # Direct Python — useful when debugging imports or the venv
+> python3 trader-cli/main.py analyze "BTCどう？"
+>
+> # Via node_modules/.bin — created automatically by `npm install`
+> ./node_modules/.bin/trader latency scan
+> ```
 
 ### Quick start (via dev.sh)
 
@@ -224,7 +215,8 @@ trader-ai/
 ├── package.json        # Root package — tradingview-mcp + postinstall that links trader bin
 ├── scripts/
 │   ├── dev.sh          # Start TV + run CLI (daily driver; auto-runs npm install)
-│   └── trader.sh       # Thin wrapper: python3 trader-cli/main.py "$@"
+│   ├── trader.sh       # Thin wrapper: python3 trader-cli/main.py "$@"  ← recommended entry
+│   └── setup.js        # Node script that creates node_modules/.bin/trader symlink
 ├── trader-cli/
 │   ├── main.py         # CLI entry point — executable (chmod +x)
 │   ├── package.json    # bin: { trader: ./main.py } declaration
@@ -245,4 +237,16 @@ trader-ai/
     ├── trader.db       # Local SQLite database
     └── latency.jsonl   # Append-only latency event log (created by detector.py)
 ```
+
+---
+
+## Roadmap
+
+Priorities for the next development cycle, in order:
+
+| Priority | Command | Description |
+|---|---|---|
+| 1 | `trader latency analyze --json` | Output analysis as JSON for piping / scripting |
+| 2 | `trader latency candidates --top N --min-events N` | Configurable filter thresholds at runtime |
+| 3 | README Quick Start | Single-command getting-started block at the top of the README |
 
