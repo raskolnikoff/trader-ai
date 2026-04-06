@@ -261,8 +261,9 @@ def latency(
     [Experimental] Polymarket vs Binance latency tools.
 
     Sub-commands:
-      scan     – Live monitor. Detects BTC moves and measures Polymarket reaction time.
-      analyze  – Offline report. Reads data/latency.jsonl and prints summary statistics.
+      scan        – Live monitor. Detects BTC moves and measures Polymarket reaction time.
+      analyze     – Offline report. Reads data/latency.jsonl and prints summary statistics.
+      candidates  – Filter markets with consistent, repeatable lag.
 
     This is an observation tool, NOT a trading strategy.
     """
@@ -270,10 +271,12 @@ def latency(
         _run_latency_scan(threshold)
     elif action == "analyze":
         _run_latency_analyze()
+    elif action == "candidates":
+        _run_latency_candidates()
     else:
         console.print(
             f"[red]Unknown latency sub-command: '{action}'. "
-            "Use 'scan' or 'analyze'.[/red]"
+            "Use 'scan', 'analyze', or 'candidates'.[/red]"
         )
         raise typer.Exit(code=1)
 
@@ -319,6 +322,25 @@ def _run_latency_analyze() -> None:
             report,
             title="[bold cyan]Polymarket Latency Analysis[/bold cyan]",
             border_style="cyan",
+            expand=False,
+        )
+    )
+
+
+def _run_latency_candidates() -> None:
+    """Filter and score markets from data/latency.jsonl by latency consistency."""
+    try:
+        from contrib.polymarket_latency.candidates import run_candidates
+    except ImportError as exc:
+        console.print(f"[red]❌ candidates モジュールのロードに失敗しました: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    report = run_candidates()
+    console.print(
+        Panel(
+            report,
+            title="[bold green]Polymarket Latency Candidates[/bold green]",
+            border_style="green",
             expand=False,
         )
     )

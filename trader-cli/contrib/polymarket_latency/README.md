@@ -102,6 +102,55 @@ Events/hour: 24.6
 
 ---
 
+## Candidate selection
+
+After accumulating latency data with `scan`, use this command to filter markets that
+show **consistent, repeatable** lag — meaning they reliably react slowly across
+multiple events, not just once.
+
+```bash
+trader latency candidates
+```
+
+### How it works
+
+Markets are scored using:
+
+```
+score = avg_latency × log(event_count + 1)
+```
+
+This rewards **both** high average latency **and** a larger number of observations.
+A market seen once with a 10 s lag scores lower than one seen 20 times with 4 s avg.
+
+### Filter criteria (all three must be met)
+
+| Filter | Default | Meaning |
+|---|---|---|
+| `avg_latency ≥ 2.0s` | minimum | Ignores markets that react quickly on average |
+| `event_count ≥ 5` | minimum | Needs enough data to trust the average |
+| `p95 ≥ 3.0s` | minimum | Tail latency must also be elevated (no isolated spikes) |
+
+### Example output
+
+```
+🎯 Candidate Markets
+
+[0xabc12345]
+  BTC above 85k by end of April?
+  score: 8.76  |  avg: 3.92s  |  events: 12  |  p95: 5.10s
+
+[0xdef67890]
+  Bitcoin price above $80,000 on April 30?
+  score: 5.83  |  avg: 3.51s  |  events: 9   |  p95: 4.20s
+```
+
+> **Important:** This is a filtering and observation tool. Consistent latency does not
+> guarantee that a market can be profitably exploited. Treat results as hypotheses
+> to inspect manually, not as trade signals.
+
+---
+
 ## Configuration (top of detector.py)
 
 | Constant | Default | Description |
