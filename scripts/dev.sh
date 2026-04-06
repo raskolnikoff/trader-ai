@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-QUERY="${1:-BTCどう？}"
+QUERY="${1:-What is BTC doing?}"
 TV_BINARY="/Applications/TradingView.app/Contents/MacOS/TradingView"
 TV_DEBUG_PORT=9222
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

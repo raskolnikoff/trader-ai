@@ -13,4 +13,4 @@ yarn-error.log*
 data/
 *.db
 .env
-node_modules/
+node_modules/trader-cli/contrib/**/__pycache__

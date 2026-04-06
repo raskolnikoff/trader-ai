@@ -4,7 +4,8 @@
   "description": "",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "postinstall": "node scripts/setup.js"
   },
   "dependencies": {
     "tradingview-mcp": "file:./tradingview-mcp"

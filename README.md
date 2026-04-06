@@ -6,6 +6,20 @@ Claude CLI — no cloud APIs, no permission dialogs at runtime.
 
 ---
 
+## ⚡ Quick Start
+
+```bash
+npm install                              # installs deps + links trader CLI
+pip install -r trader-cli/requirements.txt
+
+./scripts/trader.sh latency scan         # live Binance → Polymarket monitor
+./scripts/trader.sh latency analyze      # summary stats from saved log
+./scripts/trader.sh latency candidates   # markets with consistent lag
+./scripts/trader.sh analyze "What is BTC doing?"  # AI analysis via Claude
+```
+
+---
+
 ## Architecture
 
 ```
@@ -89,20 +103,42 @@ claude mcp add --transport stdio tradingview -- \
 
 ## Usage
 
+### Run CLI
+
+```bash
+# Recommended — works from the project root, no PATH setup needed
+./scripts/trader.sh analyze "What is BTC doing?"
+./scripts/trader.sh latency scan
+./scripts/trader.sh latency analyze
+./scripts/trader.sh latency candidates
+./scripts/trader.sh history
+./scripts/trader.sh search "BTC"
+```
+
+> **Alternative / debug options** (both are equivalent to the above):
+>
+> ```bash
+> # Direct Python — useful when debugging imports or the venv
+> python3 trader-cli/main.py analyze "What is BTC doing?"
+>
+> # Via node_modules/.bin — created automatically by `npm install`
+> ./node_modules/.bin/trader latency scan
+> ```
+
 ### Quick start (via dev.sh)
 
 ```bash
-bash scripts/dev.sh "BTCどう？"
+bash scripts/dev.sh "What is BTC doing?"
 ```
 
 ### Direct CLI commands
 
 ```bash
 # Analyze with a question
-python3 trader-cli/main.py analyze "BTCどう？"
+python3 trader-cli/main.py analyze "What is BTC doing?"
 
 # Override symbol and timeframe
-python3 trader-cli/main.py analyze "どう思う？" --symbol BTCUSDT --timeframe 1h
+python3 trader-cli/main.py analyze "What do you think?" --symbol BTCUSDT --timeframe 1h
 
 # Show recent conversation history
 python3 trader-cli/main.py history
@@ -116,11 +152,11 @@ python3 trader-cli/main.py search "BTC"
 Every analysis response follows this structure:
 
 ```
-📊 状況       — objective market description
-💡 判断       — buy / sell / neutral in one sentence
-🧠 根拠       — up to 3 technical or fundamental reasons
-⚠️ 注意       — risks and caveats
-🎯 次に見る価格帯 — support / resistance / target zones
+📊 Status      — objective market description
+💡 Assessment  — buy / sell / neutral in one sentence
+🧠 Rationale   — up to 3 technical or fundamental reasons
+⚠️ Caution     — risks and caveats
+🎯 Key levels  — support / resistance / target zones
 ```
 
 ---
@@ -164,7 +200,7 @@ npx tv ohlcv --summary
 npx tv data lines
 ```
 
-### `TradingView に接続できません（CDP port 9222）`
+### `Cannot connect to TradingView (CDP port 9222)`
 
 TradingView is not running with the debug port. Either:
 - Use `dev.sh` which starts TradingView automatically, or
@@ -190,20 +226,41 @@ Ensure you are running `python3 trader-cli/main.py analyze "..."` directly,
 
 ```
 trader-ai/
-├── package.json        # Root package — tradingview-mcp is a file: dependency
+├── package.json        # Root package — tradingview-mcp + postinstall that links trader bin
 ├── scripts/
-│   └── dev.sh          # Start TV + run CLI (daily driver; auto-runs npm install)
+│   ├── dev.sh          # Start TV + run CLI (daily driver; auto-runs npm install)
+│   ├── trader.sh       # Thin wrapper: python3 trader-cli/main.py "$@"  ← recommended entry
+│   └── setup.js        # Node script that creates node_modules/.bin/trader symlink
 ├── trader-cli/
-│   ├── main.py         # CLI commands (analyze / history / search)
+│   ├── main.py         # CLI entry point — executable (chmod +x)
+│   ├── package.json    # bin: { trader: ./main.py } declaration
 │   ├── tv_client.py    # TradingView data via ./node_modules/.bin/tv (no global install)
 │   ├── claude_client.py# Claude CLI subprocess wrapper (stdin, no API key)
 │   ├── prompts.py      # Prompt assembly + intent routing
 │   ├── rag.py          # RAG retrieval with weighted scoring
 │   ├── db.py           # SQLite storage layer
-│   └── requirements.txt
+│   ├── requirements.txt
+│   └── contrib/
+│       └── polymarket_latency/   # Experimental latency measurement tools
+│           ├── detector.py       # Live Binance → Polymarket latency scanner
+│           ├── analyze.py        # Offline summary stats from latency.jsonl
+│           └── candidates.py     # Filters markets with consistent lag
 ├── tradingview-mcp/    # External — do NOT modify
-├── node_modules/       # Created by npm install; contains .bin/tv
+├── node_modules/       # Created by npm install; contains .bin/tv and .bin/trader
 └── data/
-    └── trader.db       # Local SQLite database
+    ├── trader.db       # Local SQLite database
+    └── latency.jsonl   # Append-only latency event log (created by detector.py)
 ```
+
+---
+
+## Roadmap
+
+Priorities for the next development cycle, in order:
+
+| Priority | Command | Description |
+|---|---|---|
+| 1 | `trader latency analyze --json` | Output analysis as JSON for piping / scripting |
+| 2 | `trader latency candidates --top N --min-events N` | Configurable filter thresholds at runtime |
+| 3 | README Quick Start | Single-command getting-started block at the top of the README |
 

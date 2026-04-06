@@ -1,0 +1,10 @@
+{
+  "name": "trader-cli",
+  "version": "1.0.0",
+  "description": "Local-first trading assistant CLI",
+  "bin": {
+    "trader": "./main.py"
+  },
+  "private": true
+}
+
