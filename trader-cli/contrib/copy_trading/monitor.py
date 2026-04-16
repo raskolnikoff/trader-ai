@@ -25,14 +25,15 @@ Alert format (printed to stdout):
 
 Requires:
     No extra dependencies (stdlib only).
-    leaderboard.py and wallet_scorer.py in the same package for --scan-leaderboard.
+    leaderboard.py and wallet_scorer.py must be in the same directory.
 """
 
 import argparse
 import json
+import sys
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -43,13 +44,13 @@ DATA_API_BASE  = "https://data-api.polymarket.com"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 REQUEST_TIMEOUT = 10
 
-_PROJECT_ROOT      = Path(__file__).parent.parent.parent.parent
-WATCHED_PATH       = _PROJECT_ROOT / "data" / "watched_wallets.json"
-SEEN_TRADES_PATH   = _PROJECT_ROOT / "data" / "seen_trades.json"
+_PROJECT_ROOT    = Path(__file__).parent.parent.parent.parent
+WATCHED_PATH     = _PROJECT_ROOT / "data" / "watched_wallets.json"
+SEEN_TRADES_PATH = _PROJECT_ROOT / "data" / "seen_trades.json"
 
-DEFAULT_INTERVAL   = 60    # seconds between polls
-DEFAULT_LIMIT      = 20    # trades to fetch per wallet per poll
-LEADERBOARD_TOP_N  = 30    # wallets to pull when --scan-leaderboard
+DEFAULT_INTERVAL  = 60    # seconds between polls
+DEFAULT_LIMIT     = 20    # trades to fetch per wallet per poll
+LEADERBOARD_TOP_N = 30    # wallets to pull when --scan-leaderboard
 
 
 # -- Data containers -----------------------------------------------------------
@@ -57,7 +58,7 @@ LEADERBOARD_TOP_N  = 30    # wallets to pull when --scan-leaderboard
 @dataclass
 class WatchedWallet:
     address: str
-    label: str = ""     # human-readable name / tag
+    label: str = ""
 
 
 @dataclass
@@ -67,7 +68,7 @@ class TradeAlert:
     tx_hash: str
     market_question: str
     market_slug: str
-    side: str           # "YES" | "NO"
+    side: str
     size: float
     price: float
     timestamp: float
@@ -91,7 +92,7 @@ def _fetch_json(url: str) -> Optional[dict | list]:
         return None
 
 
-# -- Persistence helpers -------------------------------------------------------
+# -- Persistence ---------------------------------------------------------------
 
 def load_watched(path: Path = WATCHED_PATH) -> list[WatchedWallet]:
     if not path.exists():
@@ -126,18 +127,15 @@ def load_seen(path: Path = SEEN_TRADES_PATH) -> set[str]:
 
 def save_seen(seen: set[str], path: Path = SEEN_TRADES_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Keep only the last 10,000 hashes to avoid unbounded growth
-    trimmed = list(seen)[-10_000:]
-    path.write_text(json.dumps(trimmed), encoding="utf-8")
+    path.write_text(json.dumps(list(seen)[-10_000:]), encoding="utf-8")
 
 
-# -- Market metadata -----------------------------------------------------------
+# -- Market metadata cache -----------------------------------------------------
 
 _market_cache: dict[str, dict] = {}
 
 
 def fetch_market(condition_id: str) -> dict:
-    """Fetch market metadata from Gamma API. Cached per condition_id."""
     if condition_id in _market_cache:
         return _market_cache[condition_id]
     url  = f"{GAMMA_API_BASE}/markets?conditionId={condition_id}"
@@ -153,8 +151,8 @@ def fetch_market(condition_id: str) -> dict:
 # -- Trade polling -------------------------------------------------------------
 
 def poll_wallet(address: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
-    """Fetch the most recent trades for a wallet."""
-    url  = f"{DATA_API_BASE}/trades?maker={address}&limit={limit}"
+    """Fetch most recent trades for a wallet via Data API /trades."""
+    url  = f"{DATA_API_BASE}/trades?user={address}&limit={limit}"
     data = _fetch_json(url)
     if data is None:
         return []
@@ -165,10 +163,6 @@ def detect_new_trades(
     wallet: WatchedWallet,
     seen: set[str],
 ) -> tuple[list[TradeAlert], set[str]]:
-    """
-    Poll wallet, compare against seen set, return new TradeAlerts.
-    Returns (new_alerts, updated_seen_set).
-    """
     raw_trades = poll_wallet(wallet.address)
     new_alerts: list[TradeAlert] = []
 
@@ -176,7 +170,6 @@ def detect_new_trades(
         if not isinstance(trade, dict):
             continue
 
-        # Deduplicate by transaction hash or a composite key
         tx = (
             trade.get("transactionHash")
             or trade.get("txHash")
@@ -186,25 +179,21 @@ def detect_new_trades(
             continue
         seen.add(tx)
 
-        # Parse fields
         try:
             size  = float(trade.get("size", 0) or 0)
             price = float(trade.get("price", 0) or 0)
-            ts    = float(trade.get("timestamp") or trade.get("created_at") or 0)
+            ts    = float(trade.get("timestamp") or 0)
         except (TypeError, ValueError):
             continue
 
         if size <= 0:
             continue
 
-        # Only alert on BUY-side entries (opening positions)
-        side_raw = trade.get("side", "").upper()
-        outcome  = trade.get("outcome", trade.get("side", ""))
-
-        cond_id  = trade.get("conditionId") or trade.get("market_id", "")
+        outcome  = trade.get("outcome") or trade.get("side", "")
+        cond_id  = trade.get("conditionId") or ""
         market   = fetch_market(cond_id) if cond_id else {}
-        question = market.get("question") or cond_id[:30] or "Unknown market"
-        slug     = market.get("slug") or ""
+        question = market.get("question") or trade.get("title") or cond_id[:30] or "Unknown"
+        slug     = market.get("slug") or trade.get("eventSlug") or trade.get("slug") or ""
 
         new_alerts.append(TradeAlert(
             wallet_address=wallet.address,
@@ -212,7 +201,7 @@ def detect_new_trades(
             tx_hash=tx,
             market_question=question,
             market_slug=slug,
-            side=outcome or side_raw,
+            side=outcome,
             size=size,
             price=price,
             timestamp=ts,
@@ -224,10 +213,12 @@ def detect_new_trades(
 # -- Alert formatting ----------------------------------------------------------
 
 def format_alert(alert: TradeAlert) -> str:
-    ts_str = datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).strftime("%H:%M:%S UTC") \
-             if alert.timestamp else "unknown time"
-    link   = f"https://polymarket.com/event/{alert.market_slug}" if alert.market_slug else ""
-    lines  = [
+    ts_str = (
+        datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).strftime("%H:%M:%S UTC")
+        if alert.timestamp else "unknown time"
+    )
+    link  = f"https://polymarket.com/event/{alert.market_slug}" if alert.market_slug else ""
+    lines = [
         f"\n[ALERT] {alert.wallet_label} ({alert.wallet_address[:10]}...)  @ {ts_str}",
         f"  Market : {alert.market_question[:80]}",
         f"  Side   : {alert.side}",
@@ -238,18 +229,14 @@ def format_alert(alert: TradeAlert) -> str:
     return "\n".join(lines)
 
 
-# -- Main monitor loop ---------------------------------------------------------
+# -- Monitor loop --------------------------------------------------------------
 
-def run_monitor(
-    wallets: list[WatchedWallet],
-    interval: int = DEFAULT_INTERVAL,
-) -> None:
+def run_monitor(wallets: list[WatchedWallet], interval: int = DEFAULT_INTERVAL) -> None:
     if not wallets:
-        print("[monitor] No wallets to watch. Add wallets with --add 0x...")
+        print("[monitor] No wallets to watch. Use --add 0x... to add wallets.")
         return
 
     seen = load_seen()
-
     print(f"[monitor] Watching {len(wallets)} wallets  (poll every {interval}s)")
     for w in wallets:
         print(f"  {w.label or '(no label)':20}  {w.address}")
@@ -260,7 +247,6 @@ def run_monitor(
             alerts, seen = detect_new_trades(wallet, seen)
             for alert in alerts:
                 print(format_alert(alert))
-
         save_seen(seen)
         time.sleep(interval)
 
@@ -269,52 +255,43 @@ def run_monitor(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Monitor Polymarket wallets for new trades (copy trading alerts)"
+        description="Monitor Polymarket wallets for new trades"
     )
-    parser.add_argument(
-        "--wallets", default=str(WATCHED_PATH),
-        help=f"Path to watched_wallets.json [default: {WATCHED_PATH}]",
-    )
-    parser.add_argument(
-        "--interval", type=int, default=DEFAULT_INTERVAL,
-        help=f"Poll interval in seconds [default: {DEFAULT_INTERVAL}]",
-    )
-    parser.add_argument(
-        "--add", metavar="ADDRESS",
-        help="Add a wallet address to the watch list and exit",
-    )
-    parser.add_argument(
-        "--label", default="",
-        help="Label for --add (e.g. 'bot_A')",
-    )
-    parser.add_argument(
-        "--scan-leaderboard", action="store_true",
-        help=f"Auto-populate watch list from top {LEADERBOARD_TOP_N} leaderboard wallets",
-    )
+    parser.add_argument("--wallets", default=str(WATCHED_PATH))
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
+    parser.add_argument("--add", metavar="ADDRESS",
+                        help="Add a wallet to the watch list and exit")
+    parser.add_argument("--label", default="",
+                        help="Label for --add")
+    parser.add_argument("--scan-leaderboard", action="store_true",
+                        help="Auto-populate from top traders (leaderboard.py)")
     args = parser.parse_args()
 
     watched_path = Path(args.wallets)
 
-    # -- Add a wallet and exit -------------------------------------------------
     if args.add:
-        wallets = load_watched(watched_path)
+        wallets  = load_watched(watched_path)
         existing = {w.address for w in wallets}
         if args.add in existing:
             print(f"[monitor] {args.add} is already in the watch list.")
         else:
             wallets.append(WatchedWallet(address=args.add, label=args.label))
             save_watched(wallets, watched_path)
-            print(f"[monitor] Added {args.add} ({args.label or 'no label'}).")
-            print(f"          Watch list now has {len(wallets)} wallets.")
+            print(f"[monitor] Added {args.add} (label: {args.label or 'none'}).")
+            print(f"          Watch list: {len(wallets)} wallet(s).")
         return
 
-    # -- Scan leaderboard and populate -----------------------------------------
     if args.scan_leaderboard:
-        from contrib.copy_trading.leaderboard import fetch_leaderboard
-        from contrib.copy_trading.wallet_scorer import evaluate_wallet
+        # Add this file's directory to sys.path for sibling imports
+        _here = Path(__file__).parent
+        if str(_here) not in sys.path:
+            sys.path.insert(0, str(_here))
 
-        print(f"[monitor] Fetching top {LEADERBOARD_TOP_N} wallets from leaderboard...")
-        entries  = fetch_leaderboard(period="7d", limit=LEADERBOARD_TOP_N)
+        from leaderboard import fetch_top_traders
+        from wallet_scorer import evaluate_wallet
+
+        print(f"[monitor] Scanning leaderboard for top {LEADERBOARD_TOP_N} traders...")
+        entries  = fetch_top_traders(market_limit=20, holders_limit=10, top_n=LEADERBOARD_TOP_N)
         existing = {w.address for w in load_watched(watched_path)}
         added    = 0
 
@@ -335,10 +312,9 @@ def main() -> None:
             else:
                 print(f"  [-] {entry.username[:20]:<20}  {score.disqualify_reason}")
 
-        print(f"\n[monitor] Added {added} candidate wallets.")
+        print(f"\n[monitor] Added {added} candidate wallet(s).")
         return
 
-    # -- Normal monitor loop ---------------------------------------------------
     wallets = load_watched(watched_path)
     run_monitor(wallets, interval=args.interval)
 
