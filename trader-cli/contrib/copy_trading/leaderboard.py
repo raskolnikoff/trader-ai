@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-Polymarket leaderboard fetcher.
+Polymarket top-trader finder.
 
-Fetches top wallets by PnL from the Polymarket Data API (no auth required)
-and returns structured WalletEntry objects for downstream scoring.
+The Data API has no /leaderboard endpoint. Instead, this module:
+  1. Fetches active high-volume markets from the Gamma API
+  2. For each market, fetches the top holders via Data API /holders
+  3. Deduplicates and ranks wallets by total position value
+
+This gives us a list of large, active traders worth watching -- the
+closest equivalent to a "leaderboard" available without auth.
+
+Alternatively, pass known wallet addresses directly to wallet_scorer.py
+and monitor.py via --add 0x... if you already have targets.
 
 Usage (standalone):
     python leaderboard.py
-    python leaderboard.py --period week --limit 50
-    python leaderboard.py --period month --limit 20 --json
+    python leaderboard.py --markets 10 --holders 5
+    python leaderboard.py --json
 """
 
 import argparse
@@ -19,45 +27,32 @@ from typing import Optional
 
 # -- Constants -----------------------------------------------------------------
 
-DATA_API_BASE = "https://data-api.polymarket.com"
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+DATA_API_BASE  = "https://data-api.polymarket.com"
 REQUEST_TIMEOUT = 10
 
-# Valid period values accepted by the Data API
-VALID_PERIODS = ("1d", "7d", "30d", "all")
-PERIOD_ALIASES = {"day": "1d", "week": "7d", "month": "30d"}
-
-DEFAULT_PERIOD = "7d"
-DEFAULT_LIMIT  = 100
+DEFAULT_MARKET_LIMIT  = 20   # top active markets to scan
+DEFAULT_HOLDERS_LIMIT = 10   # top holders per market
+DEFAULT_TOP_N         = 30   # max wallets to return after dedup
 
 
 # -- Data container ------------------------------------------------------------
 
 @dataclass
 class WalletEntry:
-    proxy_address: str       # Polymarket proxy wallet (use this for tracking)
-    username: str            # display name or truncated address
-    pnl: float               # profit/loss in USDC
-    volume: float            # total volume traded in USDC
-    trades_count: int        # number of trades
-    win_rate: Optional[float]  # fraction 0-1, if available from API
-    period: str              # period this entry covers
-
-    @property
-    def avg_trade_size(self) -> float:
-        if self.trades_count == 0:
-            return 0.0
-        return round(self.volume / self.trades_count, 2)
+    proxy_address: str
+    username: str
+    total_position: float   # sum of position sizes across all found markets
+    markets_count: int      # number of distinct markets this wallet appears in
+    source: str             # "holders" - how this wallet was discovered
 
     def to_dict(self) -> dict:
         return {
-            "proxy_address": self.proxy_address,
-            "username":      self.username,
-            "pnl":           self.pnl,
-            "volume":        self.volume,
-            "trades_count":  self.trades_count,
-            "win_rate":      self.win_rate,
-            "avg_trade_size": self.avg_trade_size,
-            "period":        self.period,
+            "proxy_address":   self.proxy_address,
+            "username":        self.username,
+            "total_position":  round(self.total_position, 2),
+            "markets_count":   self.markets_count,
+            "source":          self.source,
         }
 
 
@@ -79,102 +74,118 @@ def _fetch_json(url: str) -> Optional[dict | list]:
         return None
 
 
-# -- Leaderboard fetch ---------------------------------------------------------
+# -- Market fetcher ------------------------------------------------------------
 
-def _resolve_period(period: str) -> str:
-    """Normalize period aliases to API values."""
-    return PERIOD_ALIASES.get(period.lower(), period.lower())
-
-
-def fetch_leaderboard(
-    period: str = DEFAULT_PERIOD,
-    limit: int  = DEFAULT_LIMIT,
-    order_by: str = "pnl",
-) -> list[WalletEntry]:
+def fetch_top_markets(limit: int = DEFAULT_MARKET_LIMIT) -> list[dict]:
     """
-    Fetch top wallets from the Polymarket Data API leaderboard endpoint.
-
-    Args:
-        period:   One of: 1d, 7d, 30d, all  (also accepts day/week/month)
-        limit:    Max number of wallets to return (server max ~500)
-        order_by: "pnl" or "volume"
-
-    Returns:
-        List of WalletEntry sorted by PnL descending.
+    Fetch active markets sorted by volume descending from the Gamma API.
+    Returns raw market dicts with at minimum: conditionId, question, volume.
     """
-    period = _resolve_period(period)
     url = (
-        f"{DATA_API_BASE}/leaderboard"
-        f"?period={period}&limit={limit}&order_by={order_by}"
+        f"{GAMMA_API_BASE}/markets"
+        f"?active=true&closed=false&limit={limit}&order=volume&ascending=false"
     )
     data = _fetch_json(url)
     if data is None:
         return []
+    return data if isinstance(data, list) else data.get("data", [])
 
-    # API may return a list directly or {"data": [...]}
+
+# -- Holder fetcher ------------------------------------------------------------
+
+def fetch_holders(condition_id: str, limit: int = DEFAULT_HOLDERS_LIMIT) -> list[dict]:
+    """
+    Fetch top holders for a market from the Data API /holders endpoint.
+    Returns list of holder dicts: proxyWallet, name, amount.
+    """
+    url = f"{DATA_API_BASE}/holders?market={condition_id}&limit={limit}"
+    data = _fetch_json(url)
+    if data is None:
+        return []
+
+    # Response is a list of token groups: [{token: ..., holders: [...]}, ...]
+    holders = []
     rows = data if isinstance(data, list) else data.get("data", [])
+    for token_group in rows:
+        if not isinstance(token_group, dict):
+            continue
+        for h in token_group.get("holders", []):
+            if isinstance(h, dict):
+                holders.append(h)
+    return holders
 
-    entries = []
-    for row in rows:
-        if not isinstance(row, dict):
+
+# -- Top-trader discovery ------------------------------------------------------
+
+def fetch_top_traders(
+    market_limit: int  = DEFAULT_MARKET_LIMIT,
+    holders_limit: int = DEFAULT_HOLDERS_LIMIT,
+    top_n: int         = DEFAULT_TOP_N,
+) -> list[WalletEntry]:
+    """
+    Scan top markets, collect holders, aggregate into ranked wallet list.
+    Wallets appearing in multiple markets are ranked higher.
+    """
+    markets = fetch_top_markets(limit=market_limit)
+    if not markets:
+        print("  [leaderboard] No markets returned from Gamma API.")
+        return []
+
+    # Accumulate: proxy_address -> {total_position, markets_count, username}
+    wallet_data: dict[str, dict] = {}
+
+    for market in markets:
+        cond_id = market.get("conditionId") or market.get("condition_id", "")
+        if not cond_id:
             continue
 
-        proxy = row.get("proxyAddress") or row.get("proxy_address") or row.get("address", "")
-        if not proxy:
-            continue
+        holders = fetch_holders(cond_id, limit=holders_limit)
+        for h in holders:
+            proxy = h.get("proxyWallet") or h.get("proxy_wallet", "")
+            if not proxy:
+                continue
+            amount = float(h.get("amount", 0) or 0)
+            name   = h.get("name") or h.get("pseudonym") or proxy[:10] + "..."
 
-        try:
-            pnl    = float(row.get("pnl", 0) or 0)
-            volume = float(row.get("volume", 0) or 0)
-            trades = int(row.get("tradesCount") or row.get("trades_count") or 0)
-        except (TypeError, ValueError):
-            continue
+            if proxy not in wallet_data:
+                wallet_data[proxy] = {
+                    "username":        name,
+                    "total_position":  0.0,
+                    "markets_count":   0,
+                }
+            wallet_data[proxy]["total_position"] += amount
+            wallet_data[proxy]["markets_count"]  += 1
 
-        # win_rate is not always present in the leaderboard response
-        wr_raw   = row.get("winRate") or row.get("win_rate")
-        win_rate = float(wr_raw) if wr_raw is not None else None
-
-        username = (
-            row.get("name")
-            or row.get("username")
-            or proxy[:10] + "..."
+    # Build WalletEntry list, sort by markets_count then total_position
+    entries = [
+        WalletEntry(
+            proxy_address=addr,
+            username=data["username"],
+            total_position=round(data["total_position"], 2),
+            markets_count=data["markets_count"],
+            source="holders",
         )
-
-        entries.append(WalletEntry(
-            proxy_address=proxy,
-            username=username,
-            pnl=round(pnl, 2),
-            volume=round(volume, 2),
-            trades_count=trades,
-            win_rate=win_rate,
-            period=period,
-        ))
-
-    # Sort by PnL descending (API usually returns sorted, but ensure it)
-    entries.sort(key=lambda e: e.pnl, reverse=True)
-    return entries
+        for addr, data in wallet_data.items()
+    ]
+    entries.sort(key=lambda e: (e.markets_count, e.total_position), reverse=True)
+    return entries[:top_n]
 
 
 # -- Formatting ----------------------------------------------------------------
 
 def format_table(entries: list[WalletEntry]) -> str:
     if not entries:
-        return "  No entries found."
+        return "  No wallets found."
 
     lines = [
-        f"{'#':<4} {'Username':<22} {'PnL':>10} {'Volume':>12} "
-        f"{'Trades':>7} {'Avg':>8} {'WinRate':>8}",
-        "-" * 76,
+        f"{'#':<4} {'Username':<22} {'Markets':>8} {'Total Position':>16}",
+        "-" * 55,
     ]
     for i, e in enumerate(entries, 1):
-        wr = f"{e.win_rate*100:.1f}%" if e.win_rate is not None else "  --"
         lines.append(
             f"{i:<4} {e.username[:22]:<22} "
-            f"${e.pnl:>9,.0f} "
-            f"${e.volume:>11,.0f} "
-            f"{e.trades_count:>7} "
-            f"${e.avg_trade_size:>7,.0f} "
-            f"{wr:>8}"
+            f"{e.markets_count:>8} "
+            f"${e.total_position:>15,.0f}"
         )
     return "\n".join(lines)
 
@@ -183,20 +194,19 @@ def format_table(entries: list[WalletEntry]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch Polymarket leaderboard (no auth required)"
+        description="Find top Polymarket traders via market holders (no auth required)"
     )
     parser.add_argument(
-        "--period", default=DEFAULT_PERIOD,
-        help="Time window: 1d, 7d, 30d, all  (or day/week/month)  [default: 7d]",
+        "--markets", type=int, default=DEFAULT_MARKET_LIMIT,
+        help=f"Number of top markets to scan [default: {DEFAULT_MARKET_LIMIT}]",
     )
     parser.add_argument(
-        "--limit", type=int, default=50,
-        help="Number of wallets to fetch [default: 50]",
+        "--holders", type=int, default=DEFAULT_HOLDERS_LIMIT,
+        help=f"Top holders to fetch per market [default: {DEFAULT_HOLDERS_LIMIT}]",
     )
     parser.add_argument(
-        "--order-by", dest="order_by", default="pnl",
-        choices=["pnl", "volume"],
-        help="Sort field [default: pnl]",
+        "--top", type=int, default=DEFAULT_TOP_N,
+        help=f"Max wallets to display [default: {DEFAULT_TOP_N}]",
     )
     parser.add_argument(
         "--json", dest="as_json", action="store_true",
@@ -204,17 +214,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    entries = fetch_leaderboard(
-        period=args.period,
-        limit=args.limit,
-        order_by=args.order_by,
+    print(f"[leaderboard] Scanning top {args.markets} markets for holders...")
+    entries = fetch_top_traders(
+        market_limit=args.markets,
+        holders_limit=args.holders,
+        top_n=args.top,
     )
 
     if args.as_json:
         print(json.dumps([e.to_dict() for e in entries], indent=2))
     else:
-        print(f"\n[leaderboard] period={args.period}  top {len(entries)} wallets\n")
+        print(f"\n[leaderboard] Top {len(entries)} traders found\n")
         print(format_table(entries))
+        print(f"\nTip: copy a proxy_address and run:")
+        print(f"     python wallet_scorer.py --address 0x...")
 
 
 if __name__ == "__main__":
