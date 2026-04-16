@@ -2,24 +2,27 @@
 """
 Wallet scorer for copy trading candidate selection.
 
-Fetches detailed trade history for a wallet from the Polymarket Data API
-and computes a composite score to identify bots / consistent winners worth
-copying. Filters out wallets that are too large to copy (whale size) or
-too inactive to trust.
+The Polymarket /trades endpoint does NOT return resolved/won fields.
+Instead, this module uses two endpoints:
+  - /trades  -> all trades (BUY + SELL) for volume, recency, activity
+  - /activity?type=REDEEM -> redemptions = winning positions paid out
 
-Scoring factors:
-    win_rate        -- fraction of trades that resolved profitably
-    pnl             -- absolute profit (USDC)
-    trade_count     -- number of resolved trades (proxy for reliability)
-    recency_score   -- fraction of trades in the last 7 days (still active?)
-    avg_trade_size  -- median trade size in USDC (must be copy-able)
+Win rate approximation:
+  win_rate = redeem_count / buy_count
+  (each REDEEM corresponds to a resolved winning position)
 
-Composite score = win_rate * log(trade_count+1) * recency_score
-                  (PnL and avg_trade_size used as hard filters only)
+This is an approximation because:
+  - A wallet may have open positions that haven't resolved yet
+  - One REDEEM can cover multiple token buys on the same market
+  But it's the best signal available from the public API without auth.
 
-Usage (standalone):
+Scoring:
+  composite = win_rate * log(buy_count + 1) * (recency + 0.1)
+
+Usage:
     python wallet_scorer.py --address 0xABC...
     python wallet_scorer.py --address 0xABC... --json
+    python wallet_scorer.py --address 0xABC... --min-trades 5 --min-win-rate 0.4
 """
 
 import argparse
@@ -28,56 +31,44 @@ import math
 import time
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Optional
 
 # -- Constants -----------------------------------------------------------------
 
 DATA_API_BASE   = "https://data-api.polymarket.com"
 REQUEST_TIMEOUT = 10
-TRADES_LIMIT    = 500    # max trades to fetch per wallet
+FETCH_LIMIT     = 500
 
-# Hard filter defaults (override via CLI)
-MIN_TRADES       = 20     # ignore wallets with fewer resolved trades
-MIN_WIN_RATE     = 0.55   # must win >55% of resolved trades
-MAX_AVG_TRADE    = 5_000  # skip whales above this avg trade size (USDC)
-MIN_AVG_TRADE    = 5      # skip dust traders
-RECENCY_DAYS     = 7      # days window for recency score
+# Default hard filters
+MIN_TRADES     = 10     # minimum BUY trades required
+MIN_WIN_RATE   = 0.40   # relaxed from 0.55 -- REDEEM-based is conservative
+MAX_AVG_TRADE  = 5_000  # skip whales
+MIN_AVG_TRADE  = 5      # skip dust
+RECENCY_DAYS   = 7
 
 
 # -- Data containers -----------------------------------------------------------
 
 @dataclass
-class TradeRecord:
-    market_id: str
-    side: str           # "BUY" | "SELL"
-    outcome: str        # "YES" | "NO"
-    size: float         # USDC value
-    price: float        # entry price (0-1)
-    timestamp: float    # unix timestamp
-    resolved: bool
-    won: Optional[bool] # None if unresolved
-
-
-@dataclass
 class WalletScore:
     address: str
-    win_rate: float
-    trade_count: int
-    resolved_count: int
-    avg_trade_size: float
-    recency_score: float   # 0-1: fraction of trades in last RECENCY_DAYS days
-    composite: float       # final ranking score
-    trades: list[TradeRecord] = field(default_factory=list, repr=False)
+    buy_count: int          # number of BUY trades
+    sell_count: int         # number of SELL trades
+    redeem_count: int       # number of REDEEM events (winning positions)
+    win_rate: float         # redeem_count / buy_count
+    avg_trade_size: float   # mean BUY size in USDC
+    recency_score: float    # fraction of buys in last RECENCY_DAYS
+    composite: float
     disqualified: bool = False
     disqualify_reason: str = ""
 
     def to_dict(self) -> dict:
         return {
             "address":        self.address,
+            "buy_count":      self.buy_count,
+            "sell_count":     self.sell_count,
+            "redeem_count":   self.redeem_count,
             "win_rate":       round(self.win_rate, 4),
-            "trade_count":    self.trade_count,
-            "resolved_count": self.resolved_count,
             "avg_trade_size": round(self.avg_trade_size, 2),
             "recency_score":  round(self.recency_score, 4),
             "composite":      round(self.composite, 4),
@@ -104,118 +95,87 @@ def _fetch_json(url: str) -> Optional[dict | list]:
         return None
 
 
-# -- Trade fetching ------------------------------------------------------------
+# -- Data fetching -------------------------------------------------------------
 
-def fetch_trades(address: str, limit: int = TRADES_LIMIT) -> list[dict]:
-    """
-    Fetch raw trade records for a wallet from the Data API.
-    Returns raw dicts; parsing is handled by parse_trades().
-
-    Note: Polymarket users have a PROXY wallet address separate from their
-    EOA. Always pass the proxy address (visible in the profile URL).
-    """
-    url = (
-        f"{DATA_API_BASE}/trades"
-        f"?maker={address}&limit={limit}&offset=0"
-    )
+def fetch_trades(address: str) -> list[dict]:
+    """Fetch all trades (BUY + SELL) for a wallet."""
+    url  = f"{DATA_API_BASE}/trades?user={address}&limit={FETCH_LIMIT}&takerOnly=false"
     data = _fetch_json(url)
     if data is None:
         return []
     return data if isinstance(data, list) else data.get("data", [])
 
 
-def parse_trades(raw: list[dict]) -> list[TradeRecord]:
-    """Convert raw API dicts to typed TradeRecord objects."""
-    records = []
-    for row in raw:
-        if not isinstance(row, dict):
-            continue
-        try:
-            size      = float(row.get("size", 0) or 0)
-            price     = float(row.get("price", 0) or 0)
-            ts_raw    = row.get("timestamp") or row.get("created_at") or 0
-            timestamp = float(ts_raw) if ts_raw else 0.0
-
-            # Determine resolution
-            outcome_index = row.get("outcomeIndex")
-            resolved_val  = row.get("resolved")
-            resolved      = bool(resolved_val) if resolved_val is not None else False
-
-            # Won: the trade was on the correct outcome side
-            won_raw = row.get("won")
-            won     = bool(won_raw) if won_raw is not None else None
-
-            records.append(TradeRecord(
-                market_id=row.get("conditionId") or row.get("market_id", ""),
-                side=row.get("side", "").upper(),
-                outcome=row.get("outcome", ""),
-                size=size,
-                price=price,
-                timestamp=timestamp,
-                resolved=resolved,
-                won=won,
-            ))
-        except (TypeError, ValueError):
-            continue
-    return records
+def fetch_redeems(address: str) -> list[dict]:
+    """
+    Fetch REDEEM activity for a wallet.
+    Each REDEEM = a winning position was claimed (market resolved YES for the held token).
+    """
+    url  = f"{DATA_API_BASE}/activity?user={address}&type=REDEEM&limit={FETCH_LIMIT}"
+    data = _fetch_json(url)
+    if data is None:
+        return []
+    return data if isinstance(data, list) else data.get("data", [])
 
 
 # -- Scoring -------------------------------------------------------------------
 
 def score_wallet(
     address: str,
-    trades: list[TradeRecord],
-    min_trades: int    = MIN_TRADES,
+    trades: list[dict],
+    redeems: list[dict],
+    min_trades: int     = MIN_TRADES,
     min_win_rate: float = MIN_WIN_RATE,
     max_avg_trade: float = MAX_AVG_TRADE,
     min_avg_trade: float = MIN_AVG_TRADE,
     recency_days: int   = RECENCY_DAYS,
 ) -> WalletScore:
-    """
-    Compute composite score for a wallet.
-    Returns a WalletScore with disqualified=True if hard filters fail.
-    """
-    resolved = [t for t in trades if t.resolved and t.won is not None]
-    won      = [t for t in resolved if t.won]
+    # Split trades into BUY / SELL
+    buys  = [t for t in trades if str(t.get("side", "")).upper() == "BUY"]
+    sells = [t for t in trades if str(t.get("side", "")).upper() == "SELL"]
 
-    trade_count    = len(trades)
-    resolved_count = len(resolved)
-    win_rate       = len(won) / resolved_count if resolved_count > 0 else 0.0
+    buy_count    = len(buys)
+    sell_count   = len(sells)
+    redeem_count = len(redeems)
 
-    sizes         = [t.size for t in trades if t.size > 0]
-    avg_trade     = sum(sizes) / len(sizes) if sizes else 0.0
+    # Win rate: redeems / buys (capped at 1.0)
+    win_rate = min(redeem_count / buy_count, 1.0) if buy_count > 0 else 0.0
 
-    # Recency: fraction of trades within RECENCY_DAYS
-    cutoff     = time.time() - recency_days * 86400
-    recent     = [t for t in trades if t.timestamp >= cutoff]
-    recency    = len(recent) / trade_count if trade_count > 0 else 0.0
+    # Avg trade size from BUY side
+    buy_sizes = [float(t.get("size", 0) or 0) for t in buys if float(t.get("size", 0) or 0) > 0]
+    avg_trade = sum(buy_sizes) / len(buy_sizes) if buy_sizes else 0.0
+
+    # Recency: fraction of buys within last RECENCY_DAYS
+    cutoff  = time.time() - recency_days * 86400
+    recent  = [t for t in buys if float(t.get("timestamp", 0) or 0) >= cutoff]
+    recency = len(recent) / buy_count if buy_count > 0 else 0.0
 
     # Composite score
-    composite = win_rate * math.log(resolved_count + 1) * (recency + 0.1)
+    composite = win_rate * math.log(buy_count + 1) * (recency + 0.1)
 
     score = WalletScore(
         address=address,
-        win_rate=win_rate,
-        trade_count=trade_count,
-        resolved_count=resolved_count,
+        buy_count=buy_count,
+        sell_count=sell_count,
+        redeem_count=redeem_count,
+        win_rate=round(win_rate, 4),
         avg_trade_size=round(avg_trade, 2),
         recency_score=round(recency, 4),
         composite=round(composite, 4),
-        trades=trades,
     )
 
-    # Apply hard filters
-    if resolved_count < min_trades:
-        score.disqualified    = True
-        score.disqualify_reason = f"too few resolved trades ({resolved_count} < {min_trades})"
+    # Hard filters
+    if buy_count < min_trades:
+        score.disqualified     = True
+        score.disqualify_reason = f"too few buys ({buy_count} < {min_trades})"
     elif win_rate < min_win_rate:
-        score.disqualified    = True
+        score.disqualified     = True
         score.disqualify_reason = f"win rate too low ({win_rate*100:.1f}% < {min_win_rate*100:.0f}%)"
     elif avg_trade > max_avg_trade:
-        score.disqualified    = True
+        score.disqualified     = True
         score.disqualify_reason = f"avg trade too large (${avg_trade:,.0f} > ${max_avg_trade:,.0f})"
     elif avg_trade < min_avg_trade:
-        score.disqualified    = True
+        score.disqualified     = True
         score.disqualify_reason = f"avg trade too small (${avg_trade:.2f} < ${min_avg_trade})"
 
     return score
@@ -229,12 +189,11 @@ def evaluate_wallet(
     min_win_rate: float = MIN_WIN_RATE,
     max_avg_trade: float = MAX_AVG_TRADE,
 ) -> WalletScore:
-    """Fetch trades and score a single wallet. Main entry point."""
-    raw    = fetch_trades(address)
-    trades = parse_trades(raw)
+    """Fetch trades + redeems and score a wallet. Main entry point."""
+    trades  = fetch_trades(address)
+    redeems = fetch_redeems(address)
     return score_wallet(
-        address,
-        trades,
+        address, trades, redeems,
         min_trades=min_trades,
         min_win_rate=min_win_rate,
         max_avg_trade=max_avg_trade,
@@ -245,16 +204,16 @@ def evaluate_wallet(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Score a Polymarket wallet for copy trading suitability"
+        description="Score a Polymarket wallet for copy trading (uses /trades + /activity REDEEM)"
     )
     parser.add_argument("--address", required=True,
                         help="Polymarket proxy wallet address (0x...)")
     parser.add_argument("--min-trades", type=int, default=MIN_TRADES,
-                        help=f"Minimum resolved trades [default: {MIN_TRADES}]")
+                        help=f"Minimum BUY trades [default: {MIN_TRADES}]")
     parser.add_argument("--min-win-rate", type=float, default=MIN_WIN_RATE,
                         help=f"Minimum win rate 0-1 [default: {MIN_WIN_RATE}]")
     parser.add_argument("--max-avg-trade", type=float, default=MAX_AVG_TRADE,
-                        help=f"Max avg trade size USDC [default: {MAX_AVG_TRADE}]")
+                        help=f"Max avg BUY size USDC [default: {MAX_AVG_TRADE}]")
     parser.add_argument("--json", dest="as_json", action="store_true",
                         help="Output machine-readable JSON")
     args = parser.parse_args()
@@ -272,10 +231,10 @@ def main() -> None:
 
     status = "[DISQUALIFIED]" if score.disqualified else "[CANDIDATE]"
     print(f"\n{status}  {score.address}")
-    print(f"  win_rate:      {score.win_rate*100:.1f}%")
-    print(f"  trades:        {score.trade_count}  (resolved: {score.resolved_count})")
+    print(f"  buys:          {score.buy_count}  sells: {score.sell_count}  redeems: {score.redeem_count}")
+    print(f"  win_rate:      {score.win_rate*100:.1f}%  (redeems / buys)")
     print(f"  avg_trade:     ${score.avg_trade_size:,.2f}")
-    print(f"  recency:       {score.recency_score*100:.0f}% trades in last 7d")
+    print(f"  recency:       {score.recency_score*100:.0f}% buys in last {RECENCY_DAYS}d")
     print(f"  composite:     {score.composite:.4f}")
     if score.disqualified:
         print(f"  reason:        {score.disqualify_reason}")
