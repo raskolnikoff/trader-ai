@@ -15,13 +15,12 @@ Usage:
     python monitor.py --add 0xABC...          # add a wallet and exit
     python monitor.py --scan-leaderboard      # auto-populate from leaderboard
 
-Alert format (printed to stdout):
-    [ALERT] <username> (<address[:8]>) opened a NEW position
-      Market : <question>
-      Side   : YES / NO
-      Size   : $<USDC>
-      Price  : <entry price>
-      Link   : https://polymarket.com/event/<slug>
+Alert format:
+    [ALERT] <username> (<address[:10]>...)  @ HH:MM:SS UTC
+      Market : <title>
+      Side   : <outcome>
+      Size   : $<USDC>  @  <price>
+      Link   : https://polymarket.com/event/<eventSlug>
 
 Requires:
     No extra dependencies (stdlib only).
@@ -40,17 +39,16 @@ from typing import Optional
 
 # -- Constants -----------------------------------------------------------------
 
-DATA_API_BASE  = "https://data-api.polymarket.com"
-GAMMA_API_BASE = "https://gamma-api.polymarket.com"
-REQUEST_TIMEOUT = 10
+DATA_API_BASE    = "https://data-api.polymarket.com"
+REQUEST_TIMEOUT  = 10
 
 _PROJECT_ROOT    = Path(__file__).parent.parent.parent.parent
 WATCHED_PATH     = _PROJECT_ROOT / "data" / "watched_wallets.json"
 SEEN_TRADES_PATH = _PROJECT_ROOT / "data" / "seen_trades.json"
 
-DEFAULT_INTERVAL  = 60    # seconds between polls
-DEFAULT_LIMIT     = 20    # trades to fetch per wallet per poll
-LEADERBOARD_TOP_N = 30    # wallets to pull when --scan-leaderboard
+DEFAULT_INTERVAL  = 60
+DEFAULT_LIMIT     = 20
+LEADERBOARD_TOP_N = 30
 
 
 # -- Data containers -----------------------------------------------------------
@@ -66,12 +64,18 @@ class TradeAlert:
     wallet_address: str
     wallet_label: str
     tx_hash: str
-    market_question: str
-    market_slug: str
-    side: str
+    title: str        # market title from /trades response
+    event_slug: str   # eventSlug from /trades response -> used for URL
+    outcome: str      # Yes / No / outcome name
     size: float
     price: float
     timestamp: float
+
+    @property
+    def link(self) -> str:
+        if self.event_slug:
+            return f"https://polymarket.com/event/{self.event_slug}"
+        return ""
 
 
 # -- HTTP helper ---------------------------------------------------------------
@@ -130,24 +134,6 @@ def save_seen(seen: set[str], path: Path = SEEN_TRADES_PATH) -> None:
     path.write_text(json.dumps(list(seen)[-10_000:]), encoding="utf-8")
 
 
-# -- Market metadata cache -----------------------------------------------------
-
-_market_cache: dict[str, dict] = {}
-
-
-def fetch_market(condition_id: str) -> dict:
-    if condition_id in _market_cache:
-        return _market_cache[condition_id]
-    url  = f"{GAMMA_API_BASE}/markets?conditionId={condition_id}"
-    data = _fetch_json(url)
-    if data is None:
-        return {}
-    rows = data if isinstance(data, list) else data.get("data", [])
-    meta = rows[0] if rows else {}
-    _market_cache[condition_id] = meta
-    return meta
-
-
 # -- Trade polling -------------------------------------------------------------
 
 def poll_wallet(address: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
@@ -189,19 +175,18 @@ def detect_new_trades(
         if size <= 0:
             continue
 
-        outcome  = trade.get("outcome") or trade.get("side", "")
-        cond_id  = trade.get("conditionId") or ""
-        market   = fetch_market(cond_id) if cond_id else {}
-        question = market.get("question") or trade.get("title") or cond_id[:30] or "Unknown"
-        slug     = market.get("slug") or trade.get("eventSlug") or trade.get("slug") or ""
+        # Use fields directly from /trades response -- no Gamma API call needed
+        title      = trade.get("title") or "Unknown market"
+        event_slug = trade.get("eventSlug") or ""   # correct field for URL
+        outcome    = trade.get("outcome") or trade.get("side", "")
 
         new_alerts.append(TradeAlert(
             wallet_address=wallet.address,
             wallet_label=wallet.label or wallet.address[:10],
             tx_hash=tx,
-            market_question=question,
-            market_slug=slug,
-            side=outcome,
+            title=title,
+            event_slug=event_slug,
+            outcome=outcome,
             size=size,
             price=price,
             timestamp=ts,
@@ -217,15 +202,14 @@ def format_alert(alert: TradeAlert) -> str:
         datetime.fromtimestamp(alert.timestamp, tz=timezone.utc).strftime("%H:%M:%S UTC")
         if alert.timestamp else "unknown time"
     )
-    link  = f"https://polymarket.com/event/{alert.market_slug}" if alert.market_slug else ""
     lines = [
         f"\n[ALERT] {alert.wallet_label} ({alert.wallet_address[:10]}...)  @ {ts_str}",
-        f"  Market : {alert.market_question[:80]}",
-        f"  Side   : {alert.side}",
+        f"  Market : {alert.title[:80]}",
+        f"  Side   : {alert.outcome}",
         f"  Size   : ${alert.size:,.2f}  @  {alert.price:.3f}",
     ]
-    if link:
-        lines.append(f"  Link   : {link}")
+    if alert.link:
+        lines.append(f"  Link   : {alert.link}")
     return "\n".join(lines)
 
 
@@ -282,7 +266,6 @@ def main() -> None:
         return
 
     if args.scan_leaderboard:
-        # Add this file's directory to sys.path for sibling imports
         _here = Path(__file__).parent
         if str(_here) not in sys.path:
             sys.path.insert(0, str(_here))
