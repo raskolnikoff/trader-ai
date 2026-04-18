@@ -6,21 +6,29 @@ Polls a list of watched wallets at a configurable interval and prints
 an alert whenever a new trade is detected. Designed for manual copy
 trading: you see the alert and place the same trade yourself on Polymarket.
 
-Watched wallets are loaded from a JSON file (default: data/watched_wallets.json).
-New trades are deduplicated via a seen-txhash set persisted in data/seen_trades.json.
+Bot filter (new in this version):
+    Detects and suppresses automated/bot trading patterns that are not
+    useful for copy trading:
+
+    1. Burst filter: 5+ trades from the same wallet at the exact same
+       timestamp -> bot liquidation/redemption, skip the burst.
+
+    2. Min size filter: trades below MIN_TRADE_SIZE (default $2) are
+       dust or test trades, not worth copying.
+
+    3. Near-certainty filter: trades at price >= 0.97 are already
+       resolved markets being swept, not actionable signals.
+
+    Filtered alerts are counted and summarized at the end of each poll
+    cycle so you know how much noise was removed.
 
 Usage:
     python monitor.py
-    python monitor.py --wallets data/watched_wallets.json --interval 30
-    python monitor.py --add 0xABC...          # add a wallet and exit
-    python monitor.py --scan-leaderboard      # auto-populate from leaderboard
-
-Alert format:
-    [ALERT] <username> (<address[:10]>...)  @ HH:MM:SS UTC
-      Market : <title>
-      Side   : <outcome>
-      Size   : $<USDC>  @  <price>
-      Link   : https://polymarket.com/event/<eventSlug>
+    python monitor.py --interval 30
+    python monitor.py --min-size 10        # only alert on $10+ trades
+    python monitor.py --no-bot-filter      # disable all filters (debug)
+    python monitor.py --add 0xABC...
+    python monitor.py --scan-leaderboard
 
 Requires:
     No extra dependencies (stdlib only).
@@ -31,11 +39,12 @@ import argparse
 import json
 import sys
 import time
-import urllib.request
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import urllib.request
 
 # -- Constants -----------------------------------------------------------------
 
@@ -47,8 +56,13 @@ WATCHED_PATH     = _PROJECT_ROOT / "data" / "watched_wallets.json"
 SEEN_TRADES_PATH = _PROJECT_ROOT / "data" / "seen_trades.json"
 
 DEFAULT_INTERVAL  = 60
-DEFAULT_LIMIT     = 20
+DEFAULT_LIMIT     = 50     # fetch more trades per poll to catch bursts
 LEADERBOARD_TOP_N = 30
+
+# Bot filter defaults
+BURST_THRESHOLD   = 5      # N+ trades at same timestamp = bot burst
+MIN_TRADE_SIZE    = 2.0    # USD -- skip dust trades
+MAX_CERTAIN_PRICE = 0.97   # skip near-resolved markets (price >= this)
 
 
 # -- Data containers -----------------------------------------------------------
@@ -64,18 +78,44 @@ class TradeAlert:
     wallet_address: str
     wallet_label: str
     tx_hash: str
-    title: str        # market title from /trades response
-    event_slug: str   # eventSlug from /trades response -> used for URL
-    outcome: str      # Yes / No / outcome name
+    title: str
+    event_slug: str
+    outcome: str
     size: float
     price: float
     timestamp: float
+    filtered: bool = False        # True if suppressed by bot filter
+    filter_reason: str = ""
 
     @property
     def link(self) -> str:
         if self.event_slug:
             return f"https://polymarket.com/event/{self.event_slug}"
         return ""
+
+
+@dataclass
+class FilterStats:
+    """Tracks how many alerts were filtered per poll cycle."""
+    burst: int = 0
+    min_size: int = 0
+    near_certain: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.burst + self.min_size + self.near_certain
+
+    def summary(self) -> str:
+        if self.total == 0:
+            return ""
+        parts = []
+        if self.burst:
+            parts.append(f"burst={self.burst}")
+        if self.min_size:
+            parts.append(f"min_size={self.min_size}")
+        if self.near_certain:
+            parts.append(f"near_certain={self.near_certain}")
+        return f"[filtered {self.total}: {', '.join(parts)}]"
 
 
 # -- HTTP helper ---------------------------------------------------------------
@@ -134,10 +174,78 @@ def save_seen(seen: set[str], path: Path = SEEN_TRADES_PATH) -> None:
     path.write_text(json.dumps(list(seen)[-10_000:]), encoding="utf-8")
 
 
+# -- Bot filter ----------------------------------------------------------------
+
+def apply_bot_filter(
+    alerts: list[TradeAlert],
+    burst_threshold: int   = BURST_THRESHOLD,
+    min_size: float        = MIN_TRADE_SIZE,
+    max_certain: float     = MAX_CERTAIN_PRICE,
+) -> tuple[list[TradeAlert], FilterStats]:
+    """
+    Apply three bot-detection heuristics to a list of new alerts.
+
+    Returns (clean_alerts, stats) where clean_alerts contains only
+    human-actionable signals and stats summarises what was filtered.
+
+    Filter 1 — Burst detection:
+        Group alerts by (wallet_address, timestamp). If a wallet fires
+        BURST_THRESHOLD or more trades at the exact same second, the
+        entire group is marked as a bot burst and suppressed.
+        Rationale: balthazar/my-macbook pattern (20x $50 @ 0.999 same ts).
+
+    Filter 2 — Minimum size:
+        Trades below min_size USD are dust or test trades.
+        Rationale: asfdt7 pattern ($0.01, $0.03, $0.06 trades).
+
+    Filter 3 — Near-certainty price:
+        Trades at price >= max_certain are already resolved markets
+        being swept by bots at near-zero risk. Not actionable.
+        Rationale: balthazar No @ 0.999 pattern.
+    """
+    stats = FilterStats()
+
+    # Pass 1: identify burst timestamps per wallet
+    ts_count: dict[tuple[str, float], int] = defaultdict(int)
+    for alert in alerts:
+        ts_count[(alert.wallet_address, alert.timestamp)] += 1
+
+    burst_keys = {
+        key for key, count in ts_count.items()
+        if count >= burst_threshold
+    }
+
+    clean: list[TradeAlert] = []
+    for alert in alerts:
+        # Burst check
+        if (alert.wallet_address, alert.timestamp) in burst_keys:
+            alert.filtered      = True
+            alert.filter_reason = f"burst ({ts_count[(alert.wallet_address, alert.timestamp)]} trades @ same ts)"
+            stats.burst += 1
+            continue
+
+        # Min size check
+        if alert.size < min_size:
+            alert.filtered      = True
+            alert.filter_reason = f"size too small (${alert.size:.2f} < ${min_size})"
+            stats.min_size += 1
+            continue
+
+        # Near-certainty check
+        if alert.price >= max_certain:
+            alert.filtered      = True
+            alert.filter_reason = f"near-certain price ({alert.price:.3f} >= {max_certain})"
+            stats.near_certain += 1
+            continue
+
+        clean.append(alert)
+
+    return clean, stats
+
+
 # -- Trade polling -------------------------------------------------------------
 
 def poll_wallet(address: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
-    """Fetch most recent trades for a wallet via Data API /trades."""
     url  = f"{DATA_API_BASE}/trades?user={address}&limit={limit}"
     data = _fetch_json(url)
     if data is None:
@@ -149,6 +257,7 @@ def detect_new_trades(
     wallet: WatchedWallet,
     seen: set[str],
 ) -> tuple[list[TradeAlert], set[str]]:
+    """Fetch trades, dedup against seen set, return new TradeAlert list."""
     raw_trades = poll_wallet(wallet.address)
     new_alerts: list[TradeAlert] = []
 
@@ -175,9 +284,8 @@ def detect_new_trades(
         if size <= 0:
             continue
 
-        # Use fields directly from /trades response -- no Gamma API call needed
         title      = trade.get("title") or "Unknown market"
-        event_slug = trade.get("eventSlug") or ""   # correct field for URL
+        event_slug = trade.get("eventSlug") or ""
         outcome    = trade.get("outcome") or trade.get("side", "")
 
         new_alerts.append(TradeAlert(
@@ -215,22 +323,41 @@ def format_alert(alert: TradeAlert) -> str:
 
 # -- Monitor loop --------------------------------------------------------------
 
-def run_monitor(wallets: list[WatchedWallet], interval: int = DEFAULT_INTERVAL) -> None:
+def run_monitor(
+    wallets: list[WatchedWallet],
+    interval: int    = DEFAULT_INTERVAL,
+    bot_filter: bool = True,
+    min_size: float  = MIN_TRADE_SIZE,
+) -> None:
     if not wallets:
         print("[monitor] No wallets to watch. Use --add 0x... to add wallets.")
         return
 
     seen = load_seen()
     print(f"[monitor] Watching {len(wallets)} wallets  (poll every {interval}s)")
+    print(f"          bot_filter={bot_filter}  min_size=${min_size}")
     for w in wallets:
         print(f"  {w.label or '(no label)':20}  {w.address}")
     print("  Ctrl+C to stop\n")
 
     while True:
+        all_new: list[TradeAlert] = []
+
         for wallet in wallets:
             alerts, seen = detect_new_trades(wallet, seen)
-            for alert in alerts:
+            all_new.extend(alerts)
+
+        if bot_filter and all_new:
+            clean, stats = apply_bot_filter(all_new, min_size=min_size)
+            for alert in clean:
                 print(format_alert(alert))
+            summary = stats.summary()
+            if summary:
+                print(f"  {summary}")
+        else:
+            for alert in all_new:
+                print(format_alert(alert))
+
         save_seen(seen)
         time.sleep(interval)
 
@@ -239,14 +366,19 @@ def run_monitor(wallets: list[WatchedWallet], interval: int = DEFAULT_INTERVAL) 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Monitor Polymarket wallets for new trades"
+        description="Monitor Polymarket wallets for new trades (with bot filter)"
     )
     parser.add_argument("--wallets", default=str(WATCHED_PATH))
-    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
+                        help=f"Poll interval seconds (default: {DEFAULT_INTERVAL})")
+    parser.add_argument("--min-size", type=float, default=MIN_TRADE_SIZE,
+                        help=f"Min trade size USD to alert (default: {MIN_TRADE_SIZE})")
+    parser.add_argument("--no-bot-filter", dest="bot_filter", action="store_false",
+                        default=True,
+                        help="Disable bot filter (show all trades including bursts)")
     parser.add_argument("--add", metavar="ADDRESS",
                         help="Add a wallet to the watch list and exit")
-    parser.add_argument("--label", default="",
-                        help="Label for --add")
+    parser.add_argument("--label", default="", help="Label for --add")
     parser.add_argument("--scan-leaderboard", action="store_true",
                         help="Auto-populate from top traders (leaderboard.py)")
     args = parser.parse_args()
@@ -299,7 +431,12 @@ def main() -> None:
         return
 
     wallets = load_watched(watched_path)
-    run_monitor(wallets, interval=args.interval)
+    run_monitor(
+        wallets,
+        interval=args.interval,
+        bot_filter=args.bot_filter,
+        min_size=args.min_size,
+    )
 
 
 if __name__ == "__main__":
