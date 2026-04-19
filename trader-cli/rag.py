@@ -1,34 +1,56 @@
 """
 Retrieval-Augmented Generation (RAG) helper.
 
-Retrieval strategy (Phase 1):
+Retrieval strategy:
   1. Collect candidates from three sources, tagged with their origin.
   2. De-duplicate by message id.
   3. Score each candidate — source priority + keyword match + recency bonus.
   4. Return the top N highest-scoring unique candidates.
 
-Source priority (flat base added before keyword/recency scoring):
-  analysis_results  → +3.0  (highest signal — distilled past conclusions)
-  fts_hits          → +2.0  (keyword-matched raw messages)
-  recent            → +1.5  (recency pool, no keyword guarantee)
+Source priority:
+  analysis_results  -> +3.0  (distilled past conclusions)
+  fts_hits          -> +2.0  (keyword-matched raw messages)
+  recent            -> +1.5  (recency pool, no keyword guarantee)
 
-Keyword scoring (added per matching keyword):
-  +2.0 for exact token match (word-boundary)
-  +1.0 for substring (partial) match
+Keyword scoring (per matching keyword):
+  +2.0 for exact token match
+  +1.0 for substring match
 
 Recency bonus: +0.0 to +0.5 linearly distributed across the pool.
+
+FTS5 query sanitization:
+  SQLite FTS5 treats many characters as special (?, *, ", (, ), ^, ~, -).
+  We sanitize the query before passing to search_messages() to avoid
+  "fts5: syntax error near X" crashes. Characters outside [a-zA-Z0-9 ] are
+  stripped from the FTS query; original query is still used for keyword scoring.
 """
+
+import re
 
 from db import get_recent_messages, get_recent_analysis_results, search_messages
 
-# ── Source priority constants ─────────────────────────────────────────────────
+# -- Constants -----------------------------------------------------------------
 
 _PRIORITY_ANALYSIS = 3.0
-_PRIORITY_FTS = 2.0
-_PRIORITY_RECENT = 1.5
+_PRIORITY_FTS      = 2.0
+_PRIORITY_RECENT   = 1.5
+
+# FTS5 safe: keep only alphanumeric and spaces
+_FTS_SAFE_RE = re.compile(r"[^a-zA-Z0-9 ]")
 
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
+
+def _sanitize_fts_query(query: str) -> str:
+    """
+    Strip FTS5 special characters to avoid syntax errors.
+    Returns empty string if nothing remains (caller should skip FTS).
+    """
+    safe = _FTS_SAFE_RE.sub(" ", query)
+    # Collapse multiple spaces and strip
+    safe = " ".join(safe.split())
+    return safe
+
 
 def _score(
     candidate: dict,
@@ -37,62 +59,45 @@ def _score(
     recency_rank: int,
     total: int,
 ) -> float:
-    """
-    Compute a relevance score for a single candidate.
-
-    Parameters
-    ----------
-    candidate:       message dict with at least a 'content' key.
-    keywords:        whitespace-split tokens from the user query.
-    source_priority: flat bonus applied before keyword/recency scoring.
-    recency_rank:    0-based position in the pool (0 = most recent).
-    total:           total number of candidates (for normalising recency).
-    """
     content = candidate.get("content", "").lower()
-    score = source_priority
+    score   = source_priority
 
     for keyword in keywords:
-        keyword_lower = keyword.lower()
-        if keyword_lower in content:
-            # Exact token match (simple word-boundary via space padding)
-            if f" {keyword_lower} " in f" {content} ":
-                score += 2.0
-            else:
-                score += 1.0
+        kw = keyword.lower()
+        if kw in content:
+            score += 2.0 if f" {kw} " in f" {content} " else 1.0
 
-    # Recency bonus: most recent candidate gets +0.5, oldest gets +0.0
     recency_bonus = ((total - recency_rank) / total * 0.5) if total > 0 else 0.0
     score += recency_bonus
-
     return score
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# -- Public API ----------------------------------------------------------------
 
 def retrieve_relevant_messages(query: str, limit: int = 3) -> list[dict]:
     """
-    Return the top-`limit` most relevant past messages for the given query.
+    Return the top-limit most relevant past messages for the given query.
 
     Candidate pool:
-      - analysis_results summaries (up to 3) — source priority +3.0
-      - FTS5 keyword matches (up to 5)        — source priority +2.0
-      - Recent messages (last 5)              — source priority +1.5
+      - analysis_results summaries (up to 3)  -- priority +3.0
+      - FTS5 keyword matches (up to 5)         -- priority +2.0
+      - Recent messages (last 5)               -- priority +1.5
 
-    All sources are de-duplicated by id, scored, and sorted descending.
+    FTS query is sanitized to prevent SQLite FTS5 syntax errors.
+    If the sanitized query is empty, FTS lookup is skipped gracefully.
     """
-    keywords = [w for w in query.split() if len(w) >= 2]
+    keywords    = [w for w in query.split() if len(w) >= 2]
+    fts_query   = _sanitize_fts_query(query)
 
-    # ── Build tagged candidate pool ───────────────────────────────────────────
-
-    # analysis_results — convert to pseudo-message dicts, tag with highest priority
+    # analysis_results -> pseudo-message dicts
     analysis_candidates: list[tuple[dict, float]] = [
         (
             {
-                "id": f"ar_{row['id']}",
-                "role": "assistant",
-                "content": row["summary"],
-                "symbol": row.get("symbol"),
-                "timeframe": row.get("timeframe"),
+                "id":         f"ar_{row['id']}",
+                "role":       "assistant",
+                "content":    row["summary"],
+                "symbol":     row.get("symbol"),
+                "timeframe":  row.get("timeframe"),
                 "created_at": row["created_at"],
             },
             _PRIORITY_ANALYSIS,
@@ -100,7 +105,15 @@ def retrieve_relevant_messages(query: str, limit: int = 3) -> list[dict]:
         for row in get_recent_analysis_results(limit=3)
     ]
 
-    fts_hits = search_messages(query, limit=5) if keywords else []
+    # FTS5 search (only if sanitized query is non-empty)
+    fts_hits: list[dict] = []
+    if fts_query and keywords:
+        try:
+            fts_hits = search_messages(fts_query, limit=5)
+        except Exception:
+            # FTS errors are non-fatal -- degrade to recency-only
+            fts_hits = []
+
     fts_candidates: list[tuple[dict, float]] = [
         (msg, _PRIORITY_FTS) for msg in fts_hits
     ]
@@ -109,9 +122,9 @@ def retrieve_relevant_messages(query: str, limit: int = 3) -> list[dict]:
         (msg, _PRIORITY_RECENT) for msg in get_recent_messages(limit=5)
     ]
 
-    # Merge — analysis first (highest priority), then FTS, then recency
-    seen_ids: set = set()
-    candidates: list[tuple[dict, float]] = []  # (message, source_priority)
+    # Merge and dedup by id
+    seen_ids:   set                     = set()
+    candidates: list[tuple[dict, float]] = []
     for msg, priority in analysis_candidates + fts_candidates + recent_candidates:
         msg_id = msg.get("id")
         if msg_id not in seen_ids:
@@ -121,15 +134,33 @@ def retrieve_relevant_messages(query: str, limit: int = 3) -> list[dict]:
     if not candidates:
         return []
 
-    # ── Score and rank ────────────────────────────────────────────────────────
-    total = len(candidates)
+    # Score and rank
+    total  = len(candidates)
     scored = [
-        (
-            msg,
-            _score(msg, keywords, source_priority, rank, total),
-        )
-        for rank, (msg, source_priority) in enumerate(candidates)
+        (msg, _score(msg, keywords, priority, rank, total))
+        for rank, (msg, priority) in enumerate(candidates)
     ]
     scored.sort(key=lambda pair: pair[1], reverse=True)
-
     return [msg for msg, _ in scored[:limit]]
+
+
+# -- Symbol-aware retrieval (for tv_polymarket integration) --------------------
+
+def retrieve_relevant_messages_for_symbol(
+    query: str,
+    symbol: str,
+    limit: int = 3,
+) -> list[dict]:
+    """
+    Variant that boosts messages matching the given symbol.
+    Falls back to retrieve_relevant_messages if no symbol-specific results.
+    """
+    results = retrieve_relevant_messages(query, limit=limit * 2)
+
+    # Boost symbol-matching messages
+    symbol_upper = symbol.upper()
+    boosted = [m for m in results if (m.get("symbol") or "").upper() == symbol_upper]
+    others  = [m for m in results if (m.get("symbol") or "").upper() != symbol_upper]
+
+    combined = (boosted + others)[:limit]
+    return combined if combined else retrieve_relevant_messages(query, limit=limit)
