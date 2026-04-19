@@ -6,6 +6,7 @@ Usage:
     python analyze_unified.py "What is BTC doing?"
     python analyze_unified.py "Is SPX overextended?" --symbol SPX
     python analyze_unified.py "Analyze" --verbose
+    python analyze_unified.py "Analyze" --no-rag
 """
 
 import argparse
@@ -23,10 +24,9 @@ for _p in [str(_CLI), str(_ROOT)]:
 from contrib.tv_polymarket.signal_integrator import collect_signal, format_signal_context
 from contrib.tv_polymarket.unified_prompt import build_unified_prompt
 from claude_client import ask_claude
-# db.py is function-based (no class) -- import functions directly
-from db import initialize_db, save_message, get_recent_messages
-# rag.py function name is retrieve_relevant_messages
-from rag import retrieve_relevant_messages
+from db import initialize_db, save_message, get_recent_messages, save_analysis_result
+from prompts import extract_summary
+from rag import retrieve_relevant_messages_for_symbol
 
 
 def run_analysis(
@@ -35,7 +35,7 @@ def run_analysis(
     use_rag: bool = True,
     verbose: bool = False,
 ) -> str:
-    """Full pipeline: collect -> prompt -> Claude -> store."""
+    """Full pipeline: collect -> RAG -> prompt -> Claude -> store."""
 
     print(f"[unified] Collecting signals for {symbol}...")
     ctx = asyncio.run(collect_signal(symbol))
@@ -44,13 +44,24 @@ def run_analysis(
         print(format_signal_context(ctx))
         print()
 
+    # Infer timeframe from TV context if available
+    timeframe = None
+    if ctx.tv and ctx.tv.get("timeframe"):
+        timeframe = ctx.tv["timeframe"]
+
     relevant_messages = []
     recent_messages   = []
     if use_rag:
         try:
             initialize_db()
-            relevant_messages = retrieve_relevant_messages(query, limit=3)
-            recent_messages   = get_recent_messages(limit=4)
+            # Phase 2: symbol-aware retrieval
+            relevant_messages = retrieve_relevant_messages_for_symbol(
+                query,
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=4,
+            )
+            recent_messages = get_recent_messages(limit=4)
         except Exception as exc:
             print(f"  [rag] skipped: {exc}")
 
@@ -70,11 +81,19 @@ def run_analysis(
     if not response:
         return "[unified] No response from Claude."
 
-    # Store in DB for future RAG
+    # Store conversation in DB
     try:
         initialize_db()
-        save_message(role="user",      content=query,    symbol=symbol)
-        save_message(role="assistant", content=response, symbol=symbol)
+        save_message(role="user",      content=query,    symbol=symbol, timeframe=timeframe)
+        save_message(role="assistant", content=response, symbol=symbol, timeframe=timeframe)
+    except Exception:
+        pass
+
+    # Store distilled summary in analysis_results for high-priority RAG recall
+    try:
+        summary = extract_summary(response)
+        if summary and summary != "(empty response)":
+            save_analysis_result(summary=summary, symbol=symbol, timeframe=timeframe)
     except Exception:
         pass
 
@@ -87,8 +106,10 @@ def main() -> None:
     )
     parser.add_argument("query", nargs="?",
                         default="Analyze the current market situation.")
-    parser.add_argument("--symbol", default="BTCUSDT")
-    parser.add_argument("--no-rag", dest="use_rag", action="store_false", default=True)
+    parser.add_argument("--symbol", default="BTCUSDT",
+                        help="Symbol to analyze (default: BTCUSDT)")
+    parser.add_argument("--no-rag", dest="use_rag", action="store_false", default=True,
+                        help="Skip RAG memory retrieval")
     parser.add_argument("--verbose", action="store_true",
                         help="Print collected signal context before analysis")
     args = parser.parse_args()
