@@ -5,8 +5,9 @@ Polymarket market finder for TradingView symbols.
 Maps a TradingView symbol (e.g. BTCUSDT, SPX, AAPL) to relevant
 Polymarket prediction markets using the Gamma API.
 
-Strategy: fetch top markets by volume and filter by keyword client-side.
-The Gamma API keyword param is unreliable; client-side filtering is more accurate.
+Strategy:
+  1. Try Gamma API with tag/slug-based search for common symbols
+  2. Fall back to fetching a large batch and filtering client-side
 
 Usage (standalone):
     python polymarket_markets.py --symbol BTCUSDT
@@ -26,7 +27,7 @@ from typing import Optional
 GAMMA_API_BASE  = "https://gamma-api.polymarket.com"
 REQUEST_TIMEOUT = 10
 DEFAULT_LIMIT   = 8
-FETCH_BATCH     = 100   # fetch more and filter client-side
+FETCH_BATCH     = 500   # fetch large batch and filter client-side
 
 # Symbol -> keywords to match against market question (case-insensitive)
 SYMBOL_KEYWORDS: dict[str, list[str]] = {
@@ -170,18 +171,39 @@ def _parse_market(m: dict) -> Optional[PolymarketMarket]:
     )
 
 
-def fetch_top_markets(batch: int = FETCH_BATCH) -> list[dict]:
-    """Fetch top active markets by volume from Gamma API."""
+def _fetch_markets_page(offset: int = 0, limit: int = 100) -> list[dict]:
+    """Fetch one page of active markets sorted by volume."""
     url = (
         f"{GAMMA_API_BASE}/markets"
         f"?active=true&closed=false"
-        f"&limit={batch}"
+        f"&limit={limit}&offset={offset}"
         f"&order=volume&ascending=false"
     )
     data = _fetch_json(url)
     if data is None:
         return []
     return data if isinstance(data, list) else data.get("data", [])
+
+
+def fetch_all_active_markets(max_markets: int = FETCH_BATCH) -> list[dict]:
+    """
+    Fetch up to max_markets active markets using pagination.
+    Stops early if a page returns fewer results than requested.
+    """
+    page_size = 100
+    all_markets = []
+    offset = 0
+
+    while len(all_markets) < max_markets:
+        batch = _fetch_markets_page(offset=offset, limit=page_size)
+        if not batch:
+            break
+        all_markets.extend(batch)
+        if len(batch) < page_size:
+            break   # last page
+        offset += page_size
+
+    return all_markets[:max_markets]
 
 
 # -- Public API ----------------------------------------------------------------
@@ -193,21 +215,31 @@ def find_markets_for_symbol(
     """
     Find Polymarket markets relevant to a TradingView symbol.
 
-    Fetches top markets by volume and filters client-side by keyword match
-    against the market question. More reliable than Gamma API keyword param.
+    Fetches markets in pages and filters client-side by keyword match.
+    Stops fetching once enough matches are found (max 500 markets scanned).
     """
     keywords = get_keywords(symbol)
-    raw      = fetch_top_markets(batch=FETCH_BATCH)
+    matched: list[PolymarketMarket] = []
+    page_size = 100
+    offset = 0
+    max_scan = 500
 
-    matched = []
-    for row in raw:
-        question = row.get("question", "").lower()
-        if any(kw in question for kw in keywords):
-            m = _parse_market(row)
-            if m:
-                matched.append(m)
+    while len(matched) < limit and offset < max_scan:
+        batch = _fetch_markets_page(offset=offset, limit=page_size)
+        if not batch:
+            break
 
-    # Sort by volume descending
+        for row in batch:
+            question = row.get("question", "").lower()
+            if any(kw in question for kw in keywords):
+                m = _parse_market(row)
+                if m:
+                    matched.append(m)
+
+        if len(batch) < page_size:
+            break   # last page
+        offset += page_size
+
     matched.sort(key=lambda m: m.volume, reverse=True)
     return matched[:limit]
 
