@@ -1,55 +1,69 @@
 """
 Retrieval-Augmented Generation (RAG) helper.
 
-Retrieval strategy:
-  1. Collect candidates from three sources, tagged with their origin.
+Retrieval strategy (Phase 2 — symbol-aware):
+  1. Collect candidates from four sources, tagged with origin + symbol match.
   2. De-duplicate by message id.
-  3. Score each candidate — source priority + keyword match + recency bonus.
+  3. Score each candidate with a multi-factor scorer.
   4. Return the top N highest-scoring unique candidates.
 
-Source priority:
-  analysis_results  -> +3.0  (distilled past conclusions)
-  fts_hits          -> +2.0  (keyword-matched raw messages)
-  recent            -> +1.5  (recency pool, no keyword guarantee)
+Scoring factors:
+  Source priority base:
+    analysis_results (symbol match)  -> +4.0
+    analysis_results (any symbol)    -> +3.0
+    fts_hits (symbol match)          -> +3.0
+    fts_hits (any)                   -> +2.0
+    recent (symbol match)            -> +2.0
+    recent (any)                     -> +1.5
 
-Keyword scoring (per matching keyword):
-  +2.0 for exact token match
-  +1.0 for substring match
+  Keyword scoring (per keyword, against content):
+    exact token match  -> +2.0
+    substring match    -> +1.0
 
-Recency bonus: +0.0 to +0.5 linearly distributed across the pool.
+  Symbol match bonus:  +1.5  (message.symbol == query symbol)
+  Symbol mismatch:     -0.5  (message has a different symbol)
+  Timeframe match:     +0.5  (message.timeframe == query timeframe)
+  Recency bonus:       +0.0 to +0.5 (linear across candidate pool)
 
-FTS5 query sanitization:
-  SQLite FTS5 treats many characters as special (?, *, ", (, ), ^, ~, -).
-  We sanitize the query before passing to search_messages() to avoid
-  "fts5: syntax error near X" crashes. Characters outside [a-zA-Z0-9 ] are
-  stripped from the FTS query; original query is still used for keyword scoring.
+FTS5 sanitization:
+  Special chars (?, *, ", (, ), ^, ~, -) are stripped before FTS query.
+  Fallback to recency-only if sanitized query is empty.
 """
 
 import re
+from typing import Optional
 
-from db import get_recent_messages, get_recent_analysis_results, search_messages
+from db import (
+    get_recent_messages,
+    get_recent_messages_by_symbol,
+    get_recent_analysis_results,
+    get_analysis_results_by_symbol,
+    search_messages,
+    search_messages_by_symbol,
+)
 
 # -- Constants -----------------------------------------------------------------
 
-_PRIORITY_ANALYSIS = 3.0
-_PRIORITY_FTS      = 2.0
-_PRIORITY_RECENT   = 1.5
+_PRIORITY_ANALYSIS_SYMBOL  = 4.0
+_PRIORITY_ANALYSIS_ANY     = 3.0
+_PRIORITY_FTS_SYMBOL       = 3.0
+_PRIORITY_FTS_ANY          = 2.0
+_PRIORITY_RECENT_SYMBOL    = 2.0
+_PRIORITY_RECENT_ANY       = 1.5
 
-# FTS5 safe: keep only alphanumeric and spaces
+_BONUS_SYMBOL_MATCH        = 1.5
+_PENALTY_SYMBOL_MISMATCH   = 0.5
+_BONUS_TIMEFRAME_MATCH     = 0.5
+_MAX_RECENCY_BONUS         = 0.5
+
 _FTS_SAFE_RE = re.compile(r"[^a-zA-Z0-9 ]")
 
 
 # -- Helpers -------------------------------------------------------------------
 
 def _sanitize_fts_query(query: str) -> str:
-    """
-    Strip FTS5 special characters to avoid syntax errors.
-    Returns empty string if nothing remains (caller should skip FTS).
-    """
     safe = _FTS_SAFE_RE.sub(" ", query)
-    # Collapse multiple spaces and strip
-    safe = " ".join(safe.split())
-    return safe
+    return " ".join(safe.split())
 
 
 def _score(
@@ -58,109 +72,140 @@ def _score(
     source_priority: float,
     recency_rank: int,
     total: int,
+    target_symbol: Optional[str] = None,
+    target_timeframe: Optional[str] = None,
 ) -> float:
-    content = candidate.get("content", "").lower()
-    score   = source_priority
+    content   = candidate.get("content", "").lower()
+    msg_sym   = (candidate.get("symbol") or "").upper()
+    msg_tf    = (candidate.get("timeframe") or "").upper()
+    score     = source_priority
 
-    for keyword in keywords:
-        kw = keyword.lower()
-        if kw in content:
-            score += 2.0 if f" {kw} " in f" {content} " else 1.0
+    # Keyword scoring
+    for kw in keywords:
+        kw_lower = kw.lower()
+        if kw_lower in content:
+            score += 2.0 if f" {kw_lower} " in f" {content} " else 1.0
 
-    recency_bonus = ((total - recency_rank) / total * 0.5) if total > 0 else 0.0
-    score += recency_bonus
+    # Symbol bonus / penalty
+    if target_symbol:
+        target_sym = target_symbol.upper()
+        if msg_sym == target_sym:
+            score += _BONUS_SYMBOL_MATCH
+        elif msg_sym and msg_sym != target_sym:
+            score -= _PENALTY_SYMBOL_MISMATCH
+
+    # Timeframe bonus
+    if target_timeframe and msg_tf and msg_tf == target_timeframe.upper():
+        score += _BONUS_TIMEFRAME_MATCH
+
+    # Recency bonus (most recent = max bonus)
+    if total > 0:
+        score += (total - recency_rank) / total * _MAX_RECENCY_BONUS
+
     return score
+
+
+def _analysis_to_msg(row: dict) -> dict:
+    """Convert analysis_result row to pseudo-message dict."""
+    return {
+        "id":         f"ar_{row['id']}",
+        "role":       "assistant",
+        "content":    row["summary"],
+        "symbol":     row.get("symbol"),
+        "timeframe":  row.get("timeframe"),
+        "created_at": row["created_at"],
+    }
 
 
 # -- Public API ----------------------------------------------------------------
 
 def retrieve_relevant_messages(query: str, limit: int = 3) -> list[dict]:
     """
-    Return the top-limit most relevant past messages for the given query.
-
-    Candidate pool:
-      - analysis_results summaries (up to 3)  -- priority +3.0
-      - FTS5 keyword matches (up to 5)         -- priority +2.0
-      - Recent messages (last 5)               -- priority +1.5
-
-    FTS query is sanitized to prevent SQLite FTS5 syntax errors.
-    If the sanitized query is empty, FTS lookup is skipped gracefully.
+    Symbol-agnostic retrieval. Uses global pool without symbol filtering.
+    Compatible with existing callers.
     """
-    keywords    = [w for w in query.split() if len(w) >= 2]
-    fts_query   = _sanitize_fts_query(query)
+    return retrieve_relevant_messages_for_symbol(query, symbol=None, limit=limit)
 
-    # analysis_results -> pseudo-message dicts
-    analysis_candidates: list[tuple[dict, float]] = [
-        (
-            {
-                "id":         f"ar_{row['id']}",
-                "role":       "assistant",
-                "content":    row["summary"],
-                "symbol":     row.get("symbol"),
-                "timeframe":  row.get("timeframe"),
-                "created_at": row["created_at"],
-            },
-            _PRIORITY_ANALYSIS,
-        )
-        for row in get_recent_analysis_results(limit=3)
-    ]
-
-    # FTS5 search (only if sanitized query is non-empty)
-    fts_hits: list[dict] = []
-    if fts_query and keywords:
-        try:
-            fts_hits = search_messages(fts_query, limit=5)
-        except Exception:
-            # FTS errors are non-fatal -- degrade to recency-only
-            fts_hits = []
-
-    fts_candidates: list[tuple[dict, float]] = [
-        (msg, _PRIORITY_FTS) for msg in fts_hits
-    ]
-
-    recent_candidates: list[tuple[dict, float]] = [
-        (msg, _PRIORITY_RECENT) for msg in get_recent_messages(limit=5)
-    ]
-
-    # Merge and dedup by id
-    seen_ids:   set                     = set()
-    candidates: list[tuple[dict, float]] = []
-    for msg, priority in analysis_candidates + fts_candidates + recent_candidates:
-        msg_id = msg.get("id")
-        if msg_id not in seen_ids:
-            seen_ids.add(msg_id)
-            candidates.append((msg, priority))
-
-    if not candidates:
-        return []
-
-    # Score and rank
-    total  = len(candidates)
-    scored = [
-        (msg, _score(msg, keywords, priority, rank, total))
-        for rank, (msg, priority) in enumerate(candidates)
-    ]
-    scored.sort(key=lambda pair: pair[1], reverse=True)
-    return [msg for msg, _ in scored[:limit]]
-
-
-# -- Symbol-aware retrieval (for tv_polymarket integration) --------------------
 
 def retrieve_relevant_messages_for_symbol(
     query: str,
-    symbol: str,
+    symbol: Optional[str] = None,
+    timeframe: Optional[str] = None,
     limit: int = 3,
 ) -> list[dict]:
     """
-    Variant that boosts messages matching the given symbol.
-    Falls back to retrieve_relevant_messages if no symbol-specific results.
+    Symbol-aware RAG retrieval (Phase 2).
+
+    Builds a candidate pool from four sources:
+      1. analysis_results filtered by symbol  (highest priority)
+      2. analysis_results global              (fallback)
+      3. FTS5 search filtered by symbol
+      4. FTS5 search global
+      5. Recent messages filtered by symbol
+      6. Recent messages global
+
+    Applies multi-factor scoring and returns top-limit candidates.
     """
-    results = retrieve_relevant_messages(query, limit=limit * 2)
+    keywords  = [w for w in query.split() if len(w) >= 2]
+    fts_query = _sanitize_fts_query(query)
 
-    # Boost symbol-matching messages
-    symbol_upper = symbol.upper()
-    boosted = [m for m in results if (m.get("symbol") or "").upper() == symbol_upper]
-    others  = [m for m in results if (m.get("symbol") or "").upper() != symbol_upper]
+    # ── Build tagged candidate pool ────────────────────────────────────────
 
-    combined = (boosted + others)[:limit]
-    return combined if combined else retrieve_relevant_messages(query, limit=limit)
+    tagged: list[tuple[dict, float]] = []
+    seen_ids: set = set()
+
+    def _add(msg: dict, priority: float) -> None:
+        mid = msg.get("id")
+        if mid not in seen_ids:
+            seen_ids.add(mid)
+            tagged.append((msg, priority))
+
+    # 1. analysis_results by symbol
+    if symbol:
+        for row in get_analysis_results_by_symbol(symbol, limit=5):
+            _add(_analysis_to_msg(row), _PRIORITY_ANALYSIS_SYMBOL)
+
+    # 2. analysis_results global (top by recency)
+    for row in get_recent_analysis_results(limit=5):
+        _add(_analysis_to_msg(row), _PRIORITY_ANALYSIS_ANY)
+
+    # 3. FTS by symbol
+    if fts_query and keywords and symbol:
+        try:
+            for msg in search_messages_by_symbol(fts_query, symbol, limit=8):
+                _add(msg, _PRIORITY_FTS_SYMBOL)
+        except Exception:
+            pass
+
+    # 4. FTS global
+    if fts_query and keywords:
+        try:
+            for msg in search_messages(fts_query, limit=8):
+                _add(msg, _PRIORITY_FTS_ANY)
+        except Exception:
+            pass
+
+    # 5. Recent by symbol
+    if symbol:
+        for msg in get_recent_messages_by_symbol(symbol, limit=8):
+            _add(msg, _PRIORITY_RECENT_SYMBOL)
+
+    # 6. Recent global
+    for msg in get_recent_messages(limit=8):
+        _add(msg, _PRIORITY_RECENT_ANY)
+
+    if not tagged:
+        return []
+
+    # ── Score and rank ─────────────────────────────────────────────────────
+    total  = len(tagged)
+    scored = [
+        (
+            msg,
+            _score(msg, keywords, priority, rank, total,
+                   target_symbol=symbol, target_timeframe=timeframe),
+        )
+        for rank, (msg, priority) in enumerate(tagged)
+    ]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return [msg for msg, _ in scored[:limit]]
