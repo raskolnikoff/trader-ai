@@ -2,21 +2,10 @@
 """
 Unified analysis CLI: TradingView + Binance + Polymarket -> Claude.
 
-Collects data from all three sources, builds a unified prompt,
-and sends it to Claude CLI for analysis.
-
 Usage:
-    python analyze_unified.py \"What is BTC doing?\"
-    python analyze_unified.py \"Is SPX overextended?\" --symbol SPX
-    python analyze_unified.py \"Analyze\" --verbose
-
-Or via trader.sh:
-    ./scripts/trader.sh unified \"What is BTC doing?\"
-
-Requires:
-    - TradingView running with CDP port 9222 (optional, degrades gracefully)
-    - Claude CLI installed and authenticated
-    - Internet for Binance + Polymarket APIs
+    python analyze_unified.py "What is BTC doing?"
+    python analyze_unified.py "Is SPX overextended?" --symbol SPX
+    python analyze_unified.py "Analyze" --verbose
 """
 
 import argparse
@@ -33,14 +22,16 @@ for _p in [str(_CLI), str(_ROOT)]:
 
 from contrib.tv_polymarket.signal_integrator import collect_signal, format_signal_context
 from contrib.tv_polymarket.unified_prompt import build_unified_prompt
-from claude_client import query_claude
-from db import Database
-from rag import retrieve_relevant
+from claude_client import ask_claude
+# db.py is function-based (no class) -- import functions directly
+from db import initialize_db, save_message, get_recent_messages
+# rag.py function name is retrieve_relevant_messages
+from rag import retrieve_relevant_messages
 
 
 def run_analysis(
     query: str,
-    symbol: str  = "BTCUSDT",
+    symbol: str   = "BTCUSDT",
     use_rag: bool = True,
     verbose: bool = False,
 ) -> str:
@@ -53,18 +44,16 @@ def run_analysis(
         print(format_signal_context(ctx))
         print()
 
-    # RAG: retrieve relevant past analyses
     relevant_messages = []
     recent_messages   = []
     if use_rag:
         try:
-            db = Database()
-            relevant_messages = retrieve_relevant(db, query, symbol=symbol, limit=3)
-            recent_messages   = db.get_recent_messages(limit=4)
+            initialize_db()
+            relevant_messages = retrieve_relevant_messages(query, limit=3)
+            recent_messages   = get_recent_messages(limit=4)
         except Exception as exc:
             print(f"  [rag] skipped: {exc}")
 
-    # Build unified prompt
     prompt = build_unified_prompt(
         ctx,
         query=query,
@@ -72,18 +61,20 @@ def run_analysis(
         recent_messages=recent_messages,
     )
 
-    # Send to Claude CLI
     print("[unified] Sending to Claude...")
-    response = query_claude(prompt)
+    try:
+        response = ask_claude(prompt)
+    except RuntimeError as exc:
+        return f"[unified] Claude error: {exc}"
 
     if not response:
         return "[unified] No response from Claude."
 
     # Store in DB for future RAG
     try:
-        db = Database()
-        db.save_message(role="user",      content=query,    symbol=symbol)
-        db.save_message(role="assistant", content=response, symbol=symbol)
+        initialize_db()
+        save_message(role="user",      content=query,    symbol=symbol)
+        save_message(role="assistant", content=response, symbol=symbol)
     except Exception:
         pass
 
@@ -95,13 +86,9 @@ def main() -> None:
         description="Unified TV + Binance + Polymarket analysis via Claude"
     )
     parser.add_argument("query", nargs="?",
-                        default="Analyze the current market situation.",
-                        help="Question or analysis request")
-    parser.add_argument("--symbol", default="BTCUSDT",
-                        help="Symbol to analyze (default: BTCUSDT)")
-    parser.add_argument("--no-rag", dest="use_rag", action="store_false",
-                        default=True,
-                        help="Skip RAG memory retrieval")
+                        default="Analyze the current market situation.")
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--no-rag", dest="use_rag", action="store_false", default=True)
     parser.add_argument("--verbose", action="store_true",
                         help="Print collected signal context before analysis")
     args = parser.parse_args()

@@ -3,10 +3,11 @@
 Polymarket market finder for TradingView symbols.
 
 Maps a TradingView symbol (e.g. BTCUSDT, SPX, AAPL) to relevant
-Polymarket prediction markets using the Gamma API keyword search.
+Polymarket prediction markets using the Gamma API.
 
-This is the "bridge" layer: given what you're watching on TradingView,
-it finds the prediction markets that are priced on the same underlying.
+Strategy:
+  1. Try Gamma API with tag/slug-based search for common symbols
+  2. Fall back to fetching a large batch and filtering client-side
 
 Usage (standalone):
     python polymarket_markets.py --symbol BTCUSDT
@@ -16,6 +17,7 @@ Usage (standalone):
 
 import argparse
 import json
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional
@@ -25,28 +27,26 @@ from typing import Optional
 GAMMA_API_BASE  = "https://gamma-api.polymarket.com"
 REQUEST_TIMEOUT = 10
 DEFAULT_LIMIT   = 8
+FETCH_BATCH     = 500   # fetch large batch and filter client-side
 
-# Symbol -> search keywords mapping.
-# Keys are normalized (uppercase, strip exchange prefix).
-# Values are lists of search terms tried in order until results are found.
+# Symbol -> keywords to match against market question (case-insensitive)
 SYMBOL_KEYWORDS: dict[str, list[str]] = {
-    "BTCUSDT":  ["bitcoin", "BTC price", "bitcoin price"],
-    "ETHUSDT":  ["ethereum", "ETH price"],
-    "SOLUSDT":  ["solana", "SOL price"],
-    "SPX":      ["S&P 500", "SPX", "stock market"],
-    "SPXUSD":   ["S&P 500", "SPX"],
-    "NAS100":   ["nasdaq", "QQQ"],
-    "XAUUSD":   ["gold price", "gold"],
-    "EURUSD":   ["euro", "EUR/USD"],
-    "USDJPY":   ["yen", "USD/JPY", "japan"],
-    "DXY":      ["dollar index", "DXY"],
-    "AAPL":     ["Apple", "AAPL"],
-    "TSLA":     ["Tesla", "TSLA"],
-    "NVDA":     ["Nvidia", "NVDA"],
-    "MSFT":     ["Microsoft", "MSFT"],
+    "BTCUSDT":  ["bitcoin", "btc"],
+    "ETHUSDT":  ["ethereum", "eth"],
+    "SOLUSDT":  ["solana", "sol"],
+    "SPX":      ["s&p 500", "spx", "s&p500"],
+    "SPXUSD":   ["s&p 500", "spx", "s&p500"],
+    "NAS100":   ["nasdaq", "qqq", "nas100"],
+    "XAUUSD":   ["gold"],
+    "EURUSD":   ["euro", "eur/usd", "eurusd"],
+    "USDJPY":   ["yen", "usd/jpy", "usdjpy", "japan"],
+    "DXY":      ["dollar index", "dxy"],
+    "AAPL":     ["apple", "aapl"],
+    "TSLA":     ["tesla", "tsla"],
+    "NVDA":     ["nvidia", "nvda"],
+    "MSFT":     ["microsoft", "msft"],
 }
 
-# Fallback: strip common suffixes and use the base as search term
 _STRIP_SUFFIXES = ["USDT", "USD", "PERP", "SPOT"]
 
 
@@ -57,14 +57,13 @@ class PolymarketMarket:
     condition_id: str
     event_slug: str
     question: str
-    yes_price: Optional[float]   # probability YES (0-1)
+    yes_price: Optional[float]
     no_price: Optional[float]
     volume: float
     active: bool
 
     @property
     def implied_probability(self) -> Optional[float]:
-        """YES price as a percentage string."""
         if self.yes_price is not None:
             return round(self.yes_price * 100, 1)
         return None
@@ -108,34 +107,25 @@ def _fetch_json(url: str) -> Optional[dict | list]:
 # -- Symbol normalization ------------------------------------------------------
 
 def normalize_symbol(symbol: str) -> str:
-    """Strip exchange prefix and common suffixes. e.g. BINANCE:BTCUSDT -> BTCUSDT"""
     if ":" in symbol:
         symbol = symbol.split(":", 1)[1]
     return symbol.upper().strip()
 
 
-def get_search_keywords(symbol: str) -> list[str]:
-    """Return ordered list of search terms for a given normalized symbol."""
+def get_keywords(symbol: str) -> list[str]:
     norm = normalize_symbol(symbol)
-
-    # Direct lookup
     if norm in SYMBOL_KEYWORDS:
         return SYMBOL_KEYWORDS[norm]
-
-    # Strip suffix and try again
     for suffix in _STRIP_SUFFIXES:
         if norm.endswith(suffix):
             base = norm[: -len(suffix)]
             if base in SYMBOL_KEYWORDS:
                 return SYMBOL_KEYWORDS[base]
-            # Use base as generic search term
-            return [base]
-
-    # Fallback: use symbol itself
-    return [norm]
+            return [base.lower()]
+    return [norm.lower()]
 
 
-# -- Gamma API search ----------------------------------------------------------
+# -- Gamma API -----------------------------------------------------------------
 
 def _safe_float(v) -> Optional[float]:
     try:
@@ -145,7 +135,6 @@ def _safe_float(v) -> Optional[float]:
 
 
 def _parse_market(m: dict) -> Optional[PolymarketMarket]:
-    """Parse a raw Gamma API market dict into a PolymarketMarket."""
     if not isinstance(m, dict):
         return None
 
@@ -155,14 +144,12 @@ def _parse_market(m: dict) -> Optional[PolymarketMarket]:
     active     = bool(m.get("active", False))
     volume     = _safe_float(m.get("volume") or m.get("volumeNum")) or 0.0
 
-    # Price extraction -- Gamma API returns outcomePrices as ["0.70", "0.30"]
     yes_price = no_price = None
     outcome_prices = m.get("outcomePrices")
     if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
         yes_price = _safe_float(outcome_prices[0])
         no_price  = _safe_float(outcome_prices[1])
 
-    # Fallback: tokens array
     tokens = m.get("tokens")
     if yes_price is None and isinstance(tokens, list):
         prices = [_safe_float(t.get("price")) for t in tokens if isinstance(t, dict)]
@@ -184,29 +171,39 @@ def _parse_market(m: dict) -> Optional[PolymarketMarket]:
     )
 
 
-def search_markets(keyword: str, limit: int = DEFAULT_LIMIT) -> list[PolymarketMarket]:
-    """
-    Search Gamma API for active markets matching a keyword.
-    Returns markets sorted by volume descending.
-    """
+def _fetch_markets_page(offset: int = 0, limit: int = 100) -> list[dict]:
+    """Fetch one page of active markets sorted by volume."""
     url = (
         f"{GAMMA_API_BASE}/markets"
         f"?active=true&closed=false"
-        f"&keyword={urllib.parse.quote(keyword)}"
-        f"&limit={limit}"
+        f"&limit={limit}&offset={offset}"
         f"&order=volume&ascending=false"
     )
     data = _fetch_json(url)
     if data is None:
         return []
+    return data if isinstance(data, list) else data.get("data", [])
 
-    rows = data if isinstance(data, list) else data.get("data", [])
-    markets = []
-    for row in rows:
-        m = _parse_market(row)
-        if m:
-            markets.append(m)
-    return markets
+
+def fetch_all_active_markets(max_markets: int = FETCH_BATCH) -> list[dict]:
+    """
+    Fetch up to max_markets active markets using pagination.
+    Stops early if a page returns fewer results than requested.
+    """
+    page_size = 100
+    all_markets = []
+    offset = 0
+
+    while len(all_markets) < max_markets:
+        batch = _fetch_markets_page(offset=offset, limit=page_size)
+        if not batch:
+            break
+        all_markets.extend(batch)
+        if len(batch) < page_size:
+            break   # last page
+        offset += page_size
+
+    return all_markets[:max_markets]
 
 
 # -- Public API ----------------------------------------------------------------
@@ -218,17 +215,33 @@ def find_markets_for_symbol(
     """
     Find Polymarket markets relevant to a TradingView symbol.
 
-    Tries each keyword in order until at least one market is found.
-    Returns up to `limit` markets sorted by volume.
+    Fetches markets in pages and filters client-side by keyword match.
+    Stops fetching once enough matches are found (max 500 markets scanned).
     """
-    import urllib.parse  # noqa: PLC0415  (local import to avoid top-level dep)
+    keywords = get_keywords(symbol)
+    matched: list[PolymarketMarket] = []
+    page_size = 100
+    offset = 0
+    max_scan = 500
 
-    keywords = get_search_keywords(symbol)
-    for keyword in keywords:
-        markets = search_markets(keyword, limit=limit)
-        if markets:
-            return markets[:limit]
-    return []
+    while len(matched) < limit and offset < max_scan:
+        batch = _fetch_markets_page(offset=offset, limit=page_size)
+        if not batch:
+            break
+
+        for row in batch:
+            question = row.get("question", "").lower()
+            if any(kw in question for kw in keywords):
+                m = _parse_market(row)
+                if m:
+                    matched.append(m)
+
+        if len(batch) < page_size:
+            break   # last page
+        offset += page_size
+
+    matched.sort(key=lambda m: m.volume, reverse=True)
+    return matched[:limit]
 
 
 # -- Formatting ----------------------------------------------------------------
@@ -250,8 +263,6 @@ def format_markets(markets: list[PolymarketMarket], symbol: str) -> str:
 # -- Entry point ---------------------------------------------------------------
 
 def main() -> None:
-    import urllib.parse  # noqa: PLC0415
-
     parser = argparse.ArgumentParser(
         description="Find Polymarket markets relevant to a TradingView symbol"
     )
