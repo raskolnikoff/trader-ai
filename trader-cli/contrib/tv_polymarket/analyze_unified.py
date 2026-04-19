@@ -22,9 +22,11 @@ for _p in [str(_CLI), str(_ROOT)]:
 
 from contrib.tv_polymarket.signal_integrator import collect_signal, format_signal_context
 from contrib.tv_polymarket.unified_prompt import build_unified_prompt
-from claude_client import ask_claude          # correct function name in claude_client.py
-from db import Database
-from rag import retrieve_relevant
+from claude_client import ask_claude
+# db.py is function-based (no class) -- import functions directly
+from db import initialize_db, save_message, get_recent_messages
+# rag.py function name is retrieve_relevant_messages
+from rag import retrieve_relevant_messages
 
 
 def run_analysis(
@@ -46,9 +48,9 @@ def run_analysis(
     recent_messages   = []
     if use_rag:
         try:
-            db = Database()
-            relevant_messages = retrieve_relevant(db, query, symbol=symbol, limit=3)
-            recent_messages   = db.get_recent_messages(limit=4)
+            initialize_db()
+            relevant_messages = retrieve_relevant_messages(query, limit=3)
+            recent_messages   = get_recent_messages(limit=4)
         except Exception as exc:
             print(f"  [rag] skipped: {exc}")
 
@@ -68,10 +70,11 @@ def run_analysis(
     if not response:
         return "[unified] No response from Claude."
 
+    # Store in DB for future RAG
     try:
-        db = Database()
-        db.save_message(role="user",      content=query,    symbol=symbol)
-        db.save_message(role="assistant", content=response, symbol=symbol)
+        initialize_db()
+        save_message(role="user",      content=query,    symbol=symbol)
+        save_message(role="assistant", content=response, symbol=symbol)
     except Exception:
         pass
 
