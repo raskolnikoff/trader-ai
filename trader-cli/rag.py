@@ -1,33 +1,34 @@
 """
 Retrieval-Augmented Generation (RAG) helper.
 
-Retrieval strategy (Phase 2 — symbol-aware):
-  1. Collect candidates from four sources, tagged with origin + symbol match.
+Retrieval strategy (Phase 2 — symbol-aware, assistant-only):
+  1. Collect candidates from analysis_results + assistant messages only.
+     User messages are excluded -- they match the query too easily and
+     add no analytical value for future context.
   2. De-duplicate by message id.
   3. Score each candidate with a multi-factor scorer.
   4. Return the top N highest-scoring unique candidates.
 
 Scoring factors:
   Source priority base:
-    analysis_results (symbol match)  -> +4.0
-    analysis_results (any symbol)    -> +3.0
-    fts_hits (symbol match)          -> +3.0
-    fts_hits (any)                   -> +2.0
-    recent (symbol match)            -> +2.0
-    recent (any)                     -> +1.5
+    analysis_results (symbol match)     -> +4.0
+    analysis_results (any symbol)       -> +3.0
+    assistant FTS hits (symbol match)   -> +3.0
+    assistant FTS hits (any)            -> +2.0
+    recent assistant (symbol match)     -> +2.0
+    recent assistant (any)              -> +1.5
 
   Keyword scoring (per keyword, against content):
     exact token match  -> +2.0
     substring match    -> +1.0
 
-  Symbol match bonus:  +1.5  (message.symbol == query symbol)
-  Symbol mismatch:     -0.5  (message has a different symbol)
-  Timeframe match:     +0.5  (message.timeframe == query timeframe)
-  Recency bonus:       +0.0 to +0.5 (linear across candidate pool)
+  Symbol match bonus:    +1.5
+  Symbol mismatch:       -0.5
+  Timeframe match bonus: +0.5
+  Recency bonus:         +0.0 to +0.5 (linear across pool)
 
 FTS5 sanitization:
-  Special chars (?, *, ", (, ), ^, ~, -) are stripped before FTS query.
-  Fallback to recency-only if sanitized query is empty.
+  Special chars (?, *, ", (, ), ^, ~, -) stripped before FTS query.
 """
 
 import re
@@ -66,6 +67,11 @@ def _sanitize_fts_query(query: str) -> str:
     return " ".join(safe.split())
 
 
+def _only_assistant(messages: list[dict]) -> list[dict]:
+    """Filter to assistant messages only -- user messages match queries too easily."""
+    return [m for m in messages if m.get("role") == "assistant"]
+
+
 def _score(
     candidate: dict,
     keywords: list[str],
@@ -75,18 +81,16 @@ def _score(
     target_symbol: Optional[str] = None,
     target_timeframe: Optional[str] = None,
 ) -> float:
-    content   = candidate.get("content", "").lower()
-    msg_sym   = (candidate.get("symbol") or "").upper()
-    msg_tf    = (candidate.get("timeframe") or "").upper()
-    score     = source_priority
+    content = candidate.get("content", "").lower()
+    msg_sym = (candidate.get("symbol") or "").upper()
+    msg_tf  = (candidate.get("timeframe") or "").upper()
+    score   = source_priority
 
-    # Keyword scoring
     for kw in keywords:
         kw_lower = kw.lower()
         if kw_lower in content:
             score += 2.0 if f" {kw_lower} " in f" {content} " else 1.0
 
-    # Symbol bonus / penalty
     if target_symbol:
         target_sym = target_symbol.upper()
         if msg_sym == target_sym:
@@ -94,11 +98,9 @@ def _score(
         elif msg_sym and msg_sym != target_sym:
             score -= _PENALTY_SYMBOL_MISMATCH
 
-    # Timeframe bonus
     if target_timeframe and msg_tf and msg_tf == target_timeframe.upper():
         score += _BONUS_TIMEFRAME_MATCH
 
-    # Recency bonus (most recent = max bonus)
     if total > 0:
         score += (total - recency_rank) / total * _MAX_RECENCY_BONUS
 
@@ -106,7 +108,6 @@ def _score(
 
 
 def _analysis_to_msg(row: dict) -> dict:
-    """Convert analysis_result row to pseudo-message dict."""
     return {
         "id":         f"ar_{row['id']}",
         "role":       "assistant",
@@ -120,10 +121,7 @@ def _analysis_to_msg(row: dict) -> dict:
 # -- Public API ----------------------------------------------------------------
 
 def retrieve_relevant_messages(query: str, limit: int = 3) -> list[dict]:
-    """
-    Symbol-agnostic retrieval. Uses global pool without symbol filtering.
-    Compatible with existing callers.
-    """
+    """Symbol-agnostic retrieval. Backward-compatible wrapper."""
     return retrieve_relevant_messages_for_symbol(query, symbol=None, limit=limit)
 
 
@@ -134,22 +132,13 @@ def retrieve_relevant_messages_for_symbol(
     limit: int = 3,
 ) -> list[dict]:
     """
-    Symbol-aware RAG retrieval (Phase 2).
+    Symbol-aware RAG retrieval.
 
-    Builds a candidate pool from four sources:
-      1. analysis_results filtered by symbol  (highest priority)
-      2. analysis_results global              (fallback)
-      3. FTS5 search filtered by symbol
-      4. FTS5 search global
-      5. Recent messages filtered by symbol
-      6. Recent messages global
-
-    Applies multi-factor scoring and returns top-limit candidates.
+    Only assistant messages and analysis_results are used as candidates.
+    User messages are excluded because they trivially match the query.
     """
     keywords  = [w for w in query.split() if len(w) >= 2]
     fts_query = _sanitize_fts_query(query)
-
-    # ── Build tagged candidate pool ────────────────────────────────────────
 
     tagged: list[tuple[dict, float]] = []
     seen_ids: set = set()
@@ -160,51 +149,47 @@ def retrieve_relevant_messages_for_symbol(
             seen_ids.add(mid)
             tagged.append((msg, priority))
 
-    # 1. analysis_results by symbol
+    # 1. analysis_results by symbol (highest priority)
     if symbol:
-        for row in get_analysis_results_by_symbol(symbol, limit=5):
+        for row in get_analysis_results_by_symbol(symbol, limit=8):
             _add(_analysis_to_msg(row), _PRIORITY_ANALYSIS_SYMBOL)
 
-    # 2. analysis_results global (top by recency)
-    for row in get_recent_analysis_results(limit=5):
+    # 2. analysis_results global
+    for row in get_recent_analysis_results(limit=8):
         _add(_analysis_to_msg(row), _PRIORITY_ANALYSIS_ANY)
 
-    # 3. FTS by symbol
+    # 3. FTS assistant messages by symbol
     if fts_query and keywords and symbol:
         try:
-            for msg in search_messages_by_symbol(fts_query, symbol, limit=8):
+            for msg in _only_assistant(search_messages_by_symbol(fts_query, symbol, limit=8)):
                 _add(msg, _PRIORITY_FTS_SYMBOL)
         except Exception:
             pass
 
-    # 4. FTS global
+    # 4. FTS assistant messages global
     if fts_query and keywords:
         try:
-            for msg in search_messages(fts_query, limit=8):
+            for msg in _only_assistant(search_messages(fts_query, limit=8)):
                 _add(msg, _PRIORITY_FTS_ANY)
         except Exception:
             pass
 
-    # 5. Recent by symbol
+    # 5. Recent assistant messages by symbol
     if symbol:
-        for msg in get_recent_messages_by_symbol(symbol, limit=8):
+        for msg in _only_assistant(get_recent_messages_by_symbol(symbol, limit=8)):
             _add(msg, _PRIORITY_RECENT_SYMBOL)
 
-    # 6. Recent global
-    for msg in get_recent_messages(limit=8):
+    # 6. Recent assistant messages global
+    for msg in _only_assistant(get_recent_messages(limit=8)):
         _add(msg, _PRIORITY_RECENT_ANY)
 
     if not tagged:
         return []
 
-    # ── Score and rank ─────────────────────────────────────────────────────
     total  = len(tagged)
     scored = [
-        (
-            msg,
-            _score(msg, keywords, priority, rank, total,
-                   target_symbol=symbol, target_timeframe=timeframe),
-        )
+        (msg, _score(msg, keywords, priority, rank, total,
+                     target_symbol=symbol, target_timeframe=timeframe))
         for rank, (msg, priority) in enumerate(tagged)
     ]
     scored.sort(key=lambda pair: pair[1], reverse=True)
