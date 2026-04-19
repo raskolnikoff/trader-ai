@@ -2,20 +2,7 @@
 """
 Unified prompt builder for TradingView + Binance + Polymarket integration.
 
-Takes a SignalContext and assembles a structured prompt for Claude that
-combines all three data sources with intent-aware instructions.
-
-The prompt format extends the existing prompts.py structure with two
-new sections:
-  [Binance Feed]      -- real-time price momentum
-  [Polymarket Odds]   -- prediction market consensus
-
-This module is intentionally standalone (no Claude CLI invocation here).
-The caller (analyze_unified.py) handles Claude interaction.
-
-Usage (standalone -- shows prompt without calling Claude):
-    python unified_prompt.py --symbol BTCUSDT
-    python unified_prompt.py --symbol SPX --query "Is SPX overextended?"
+Takes a SignalContext and assembles a structured prompt for Claude.
 """
 
 import argparse
@@ -48,7 +35,7 @@ Analyze ALL three sources together. Look for:
   - DIVERGENCE: when they disagree -> flag explicitly and explain why
   - POLYMARKET EDGE: if prediction market odds seem mispriced vs technical reality -> note it
 
-Respond strictly in this format. Do not add sections. Keep explanations accessible.
+Respond strictly in this format. Do not add sections.
 Do NOT use any tools or external APIs. Analyze only the text data provided below.
 
 📊 Status
@@ -76,58 +63,49 @@ Do NOT use any tools or external APIs. Analyze only the text data provided below
 def _fmt_tv(tv: Optional[dict[str, Any]]) -> str:
     if not tv:
         return "TradingView: not connected"
-
     lines = []
-    symbol     = tv.get("symbol") or "?"
-    timeframe  = tv.get("timeframe") or "?"
+    symbol    = tv.get("symbol") or "?"
+    timeframe = tv.get("timeframe") or "?"
     lines.append(f"Symbol: {symbol}  |  Timeframe: {timeframe}")
-
-    quote = tv.get("quote")
-    if quote:
-        lines.append(f"Quote: {json.dumps(quote, ensure_ascii=False)}")
-
-    ohlcv = tv.get("ohlcv_summary")
-    if ohlcv:
-        lines.append(f"OHLCV: {json.dumps(ohlcv, ensure_ascii=False)}")
-
-    indicators = tv.get("indicators")
-    if indicators:
-        lines.append(f"Indicators: {json.dumps(indicators, ensure_ascii=False)}")
-
-    pine_lines = tv.get("pine_lines")
-    if pine_lines:
-        lines.append(f"Pine Lines: {json.dumps(pine_lines, ensure_ascii=False)}")
-
+    if tv.get("quote"):
+        lines.append(f"Quote: {json.dumps(tv['quote'], ensure_ascii=False)}")
+    if tv.get("ohlcv_summary"):
+        lines.append(f"OHLCV: {json.dumps(tv['ohlcv_summary'], ensure_ascii=False)}")
+    if tv.get("indicators"):
+        lines.append(f"Indicators: {json.dumps(tv['indicators'], ensure_ascii=False)}")
+    if tv.get("pine_lines"):
+        lines.append(f"Pine Lines: {json.dumps(tv['pine_lines'], ensure_ascii=False)}")
     if len(lines) == 1:
         lines.append("(No live data returned)")
-
     return "\n".join(lines)
 
 
 def _fmt_binance(binance) -> str:
     if not binance:
         return "Binance: not reachable"
-
     lines = [f"BTC Price: ${binance.price:,.2f}"]
     if binance.change_5m is not None:
-        direction = "▲" if binance.change_5m > 0 else "▼"
-        lines.append(f"5m momentum:  {direction} {binance.change_5m:+.3f}%")
+        d = "▲" if binance.change_5m > 0 else "▼"
+        lines.append(f"5m:  {d} {binance.change_5m:+.3f}%")
     if binance.change_30m is not None:
-        direction = "▲" if binance.change_30m > 0 else "▼"
-        lines.append(f"30m momentum: {direction} {binance.change_30m:+.3f}%")
+        d = "▲" if binance.change_30m > 0 else "▼"
+        lines.append(f"30m: {d} {binance.change_30m:+.3f}%")
     return "\n".join(lines)
 
 
 def _fmt_polymarket(markets) -> str:
     if not markets:
         return "No relevant Polymarket markets found."
-
     lines = []
     for m in markets:
-        prob = f"{m.implied_probability}% YES" if m.implied_probability is not None else "??% YES"
+        if m.implied_probability is not None:
+            prob = f"{m.implied_probability}% YES"
+        else:
+            # odds not available in this feed -- note it but don't hide the market
+            prob = "odds N/A"
         vol  = f"${m.volume:,.0f}" if m.volume else "n/a"
-        lines.append(f"  [{prob:>10}]  vol={vol:>10}  {m.question[:75]}")
-        lines.append(f"              {m.link}")
+        lines.append(f"  [{prob:>12}]  vol={vol:>10}  {m.question[:75]}")
+        lines.append(f"               {m.link}")
     return "\n".join(lines)
 
 
@@ -144,6 +122,19 @@ def _fmt_wallet_alerts(alerts: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_messages(msgs: list[dict]) -> str:
+    if not msgs:
+        return "None"
+    parts = []
+    for m in msgs:
+        role    = "User" if m.get("role") == "user" else "Assistant"
+        ts      = m.get("created_at", "")[:19]
+        content = m.get("content", "")[:400]
+        sym     = f" [{m['symbol']}]" if m.get("symbol") else ""
+        parts.append(f"[{ts}]{sym} {role}: {content}")
+    return "\n".join(parts)
+
+
 # -- Public API ----------------------------------------------------------------
 
 def build_unified_prompt(
@@ -152,34 +143,8 @@ def build_unified_prompt(
     relevant_messages: Optional[list[dict]] = None,
     recent_messages: Optional[list[dict]] = None,
 ) -> str:
-    """
-    Build the full unified prompt from a SignalContext.
-
-    Structure:
-        [System Instructions]
-        ---
-        [TradingView Data]
-        [Binance Feed]
-        [Polymarket Odds]
-        [Wallet Alerts]
-        [Relevant Memory]     (optional RAG results)
-        [Recent Conversation] (optional chat history)
-        [User Query]
-    """
     relevant_messages = relevant_messages or []
     recent_messages   = recent_messages or []
-
-    def _fmt_messages(msgs: list[dict]) -> str:
-        if not msgs:
-            return "None"
-        parts = []
-        for m in msgs:
-            role    = "User" if m.get("role") == "user" else "Assistant"
-            ts      = m.get("created_at", "")[:19]
-            content = m.get("content", "")[:400]
-            sym     = f" [{m['symbol']}]" if m.get("symbol") else ""
-            parts.append(f"[{ts}]{sym} {role}: {content}")
-        return "\n".join(parts)
 
     body = (
         f"[TradingView Data]\n{_fmt_tv(ctx.tv)}\n\n"
@@ -188,7 +153,7 @@ def build_unified_prompt(
         f"---\n\n"
         f"[Polymarket Odds]\n{_fmt_polymarket(ctx.polymarket_markets)}\n\n"
         f"---\n\n"
-        f"[Wallet Alerts (recent latency log)]\n{_fmt_wallet_alerts(ctx.wallet_alerts)}\n\n"
+        f"[Wallet Alerts (recent)]\n{_fmt_wallet_alerts(ctx.wallet_alerts)}\n\n"
         f"---\n\n"
         f"[Relevant Memory]\n{_fmt_messages(relevant_messages)}\n\n"
         f"---\n\n"
@@ -196,7 +161,6 @@ def build_unified_prompt(
         f"---\n\n"
         f"[User Query]\n{query}"
     )
-
     return f"{_UNIFIED_INSTRUCTIONS}\n\n---\n\n{body}"
 
 
@@ -204,13 +168,13 @@ def build_unified_prompt(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build unified TV + Binance + Polymarket prompt (preview only)"
+        description="Build unified TV + Binance + Polymarket prompt (preview)"
     )
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--query", default="Analyze the current market situation.")
     args = parser.parse_args()
 
-    ctx = asyncio.run(collect_signal(args.symbol))
+    ctx    = asyncio.run(collect_signal(args.symbol))
     prompt = build_unified_prompt(ctx, query=args.query)
     print(prompt)
 
