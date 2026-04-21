@@ -4,64 +4,63 @@ Polymarket Maker Bot.
 
 Strategy:
   1. Fetch current BTC price and momentum from Binance (5m candles).
-  2. Find the nearest active BTC Up/Down 5-minute market on Polymarket.
-  3. Compare Binance momentum with Polymarket odds to detect mispricing.
-  4. Place a limit (maker) order on the mispriced side if edge >= threshold.
-  5. Repeat on a configurable interval.
+  2. Fetch active BTC markets from Polymarket CLOB sampling endpoint.
+     Sampling markets are liquid, accepting orders, and eligible for maker rebates.
+  3. For each market, compute a fair-value probability using Binance price
+     relative to the market's resolution threshold.
+  4. Compare fair value against current Polymarket odds to detect mispricing.
+  5. Place a limit (maker) order on the underpriced side if edge >= threshold.
+  6. Repeat on a configurable interval.
 
 Maker orders pay zero fees and earn a rebate on Polymarket CLOB.
-This bot NEVER places taker orders.
+This bot NEVER places taker orders (no market orders).
 
 Safety:
   - --dry-run is the DEFAULT. Pass --live to place real orders.
   - Max position size is capped by MAX_ORDER_SIZE_USD.
   - Minimum edge required before placing is MIN_EDGE_THRESHOLD.
+  - All exceptions are caught and logged; the loop never crashes.
 
 Usage:
     # Preview only (default dry-run)
-    python maker_bot.py
+    python maker_bot.py --once --verbose
 
-    # Dry-run with verbose signal output
+    # Run continuously (dry-run)
     python maker_bot.py --verbose
 
-    # Live trading (requires POLY_* env vars)
-    python maker_bot.py --live
-
-    # Custom interval and size
-    python maker_bot.py --live --interval 60 --max-size 5.0
+    # Live trading (requires POLY_* env vars in .env)
+    python maker_bot.py --live --max-size 3.0
 
 Requirements:
-    pip install py-clob-client python-dotenv websockets
+    pip install py-clob-client python-dotenv
 """
 
 import argparse
-import asyncio
 import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
+import urllib.request
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# Load .env from repo root
+# -- Path setup ----------------------------------------------------------------
+
 _ROOT = Path(__file__).parent.parent.parent.parent
+_CLI  = Path(__file__).parent.parent.parent
+
+# Load .env from repo root before any other imports
 _dotenv_path = _ROOT / ".env"
 if _dotenv_path.exists():
     from dotenv import load_dotenv
-    load_dotenv(_dotenv_path)
+    load_dotenv(_dotenv_path, override=True)
 
-# Add trader-cli to path
-_CLI = Path(__file__).parent.parent.parent
 if str(_CLI) not in sys.path:
     sys.path.insert(0, str(_CLI))
 
-from contrib.tv_polymarket.polymarket_markets import (
-    find_markets_for_symbol,
-    PolymarketMarket,
-)
-
-# -- Logging setup -------------------------------------------------------------
+# -- Logging -------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,54 +71,72 @@ logger = logging.getLogger("maker_bot")
 
 # -- Constants -----------------------------------------------------------------
 
-# Binance REST endpoints
 BINANCE_PRICE_URL: str = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 BINANCE_KLINE_URL: str = (
     "https://api.binance.com/api/v3/klines"
-    "?symbol=BTCUSDT&interval=5m&limit=3"
+    "?symbol=BTCUSDT&interval=5m&limit=6"
 )
-
-# Polymarket CLOB endpoint
 CLOB_HOST: str = "https://clob.polymarket.com"
+CHAIN_ID: int  = 137   # Polygon
 
-# Bot parameters
-DEFAULT_INTERVAL_SEC: int   = 30    # how often to check for opportunities
-MAX_ORDER_SIZE_USD: float   = 5.0   # maximum single order size in USD
-MIN_ORDER_SIZE_USD: float   = 1.0   # minimum order size (Polymarket minimum)
-MIN_EDGE_THRESHOLD: float   = 0.04  # minimum mispricing to place order (4%)
-MAKER_PRICE_OFFSET: float   = 0.02  # place maker 2 cents below fair value
-HTTP_TIMEOUT_SEC: int       = 8
+DEFAULT_INTERVAL_SEC: int  = 60
+MAX_ORDER_SIZE_USD: float  = 5.0
+MIN_ORDER_SIZE_USD: float  = 5.0   # Polymarket minimum is $5 on sampling markets
+MIN_EDGE_THRESHOLD: float  = 0.04  # 4% minimum mispricing to place order
+MAKER_PRICE_OFFSET: float  = 0.01  # post maker 1 cent below fair value
+HTTP_TIMEOUT_SEC: int      = 8
 
-# Polymarket signature type for API-key auth (non-browser wallet)
-SIGNATURE_TYPE: int = 0
+# BTC price range keywords used to extract strike price from market question
+_PRICE_KEYWORDS: list[str] = [
+    "reach", "hit", "dip to", "above", "below", "between", "exceed"
+]
+
 
 # -- Dataclasses ---------------------------------------------------------------
 
 @dataclass
-class BinanceSignal:
-    """Current BTC price snapshot from Binance."""
+class BinanceSnapshot:
+    """Current BTC price and momentum from Binance."""
     price: float
-    change_5m: Optional[float]   # % change last 5m candle
-    direction: str               # "UP", "DOWN", or "FLAT"
-    confidence: float            # 0.0 – 1.0 (based on magnitude)
+    change_5m: Optional[float]    # % change over last 5m candle
+    change_30m: Optional[float]   # % change over last 30m (6 candles)
+    direction: str                # "UP", "DOWN", "FLAT"
+    confidence: float             # 0.0 – 1.0
+
+
+@dataclass
+class ClobMarket:
+    """
+    A single Polymarket market fetched directly from the CLOB API.
+    Unlike PolymarketMarket (from Gamma), this has real-time token prices.
+    """
+    condition_id: str
+    question: str
+    yes_token_id: str
+    no_token_id: str
+    yes_price: float
+    no_price: float
+    accepting_orders: bool
+    minimum_order_size: float
 
 
 @dataclass
 class MarketOpportunity:
-    """A detected mispricing between Binance signal and Polymarket odds."""
-    market: PolymarketMarket
-    binance_signal: BinanceSignal
-    target_side: str             # "YES" or "NO"
-    fair_value: float            # our estimated fair probability
-    market_price: float          # current Polymarket price for target_side
-    edge: float                  # fair_value - market_price (positive = underpriced)
-    suggested_price: float       # maker limit price to post
-    suggested_size: float        # order size in USD
+    """Detected mispricing between our fair-value model and Polymarket odds."""
+    market: ClobMarket
+    signal: BinanceSnapshot
+    target_side: str       # "YES" or "NO"
+    target_token_id: str   # CLOB token_id for the target side
+    fair_value: float      # our estimated probability
+    market_price: float    # current Polymarket price
+    edge: float            # fair_value - market_price (positive = underpriced)
+    order_price: float     # limit price to post (maker)
+    order_size: float      # size in USD
 
 
 @dataclass
 class OrderResult:
-    """Result of an order placement attempt."""
+    """Result of a single order placement attempt."""
     success: bool
     order_id: Optional[str]
     dry_run: bool
@@ -127,11 +144,18 @@ class OrderResult:
     error: Optional[str] = None
 
 
-# -- HTTP helpers --------------------------------------------------------------
+# -- HTTP helper ---------------------------------------------------------------
 
-def _fetch_json_sync(url: str) -> Optional[dict | list]:
-    """Fetch JSON from a URL synchronously. Returns None on any error."""
-    import urllib.request
+def _fetch_json(url: str) -> Optional[dict | list]:
+    """
+    Fetch JSON from a URL. Returns None on any network or parse error.
+
+    Args:
+        url: Full URL to fetch.
+
+    Returns:
+        Parsed JSON object, or None on failure.
+    """
     req = urllib.request.Request(
         url,
         headers={
@@ -141,24 +165,66 @@ def _fetch_json_sync(url: str) -> Optional[dict | list]:
     )
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
-            import json
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        logger.warning("HTTP fetch failed for %s: %s", url, exc)
+        logger.warning("HTTP fetch failed [%s]: %s", url[:60], exc)
         return None
+
+
+# -- CLOB client factory -------------------------------------------------------
+
+def _build_clob_client():
+    """
+    Build and return an authenticated ClobClient using environment credentials.
+
+    Returns:
+        Authenticated ClobClient instance.
+
+    Raises:
+        EnvironmentError: If required env vars are missing.
+        ImportError: If py-clob-client is not installed.
+    """
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+    except ImportError as exc:
+        raise ImportError(
+            "py-clob-client is not installed. Run: pip install py-clob-client"
+        ) from exc
+
+    required = ["POLY_API_KEY", "POLY_SECRET", "POLY_PASSPHRASE", "POLY_PRIVATE_KEY"]
+    missing  = [k for k in required if not os.environ.get(k)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env vars: {', '.join(missing)}\n"
+            "See .env.example for setup."
+        )
+
+    creds = ApiCreds(
+        api_key=os.environ["POLY_API_KEY"],
+        api_secret=os.environ["POLY_SECRET"],
+        api_passphrase=os.environ["POLY_PASSPHRASE"],
+    )
+    return ClobClient(
+        host=CLOB_HOST,
+        chain_id=CHAIN_ID,
+        key=os.environ["POLY_PRIVATE_KEY"],
+        creds=creds,
+        signature_type=0,
+    )
 
 
 # -- Binance signal ------------------------------------------------------------
 
-def fetch_binance_signal() -> Optional[BinanceSignal]:
+def fetch_binance_snapshot() -> Optional[BinanceSnapshot]:
     """
-    Fetch current BTC price and 5m momentum from Binance REST API.
+    Fetch current BTC price and recent momentum from Binance REST API.
 
     Returns:
-        BinanceSignal with direction and confidence, or None if unreachable.
+        BinanceSnapshot, or None if Binance is unreachable.
     """
-    price_data = _fetch_json_sync(BINANCE_PRICE_URL)
-    kline_data = _fetch_json_sync(BINANCE_KLINE_URL)
+    price_data = _fetch_json(BINANCE_PRICE_URL)
+    kline_data = _fetch_json(BINANCE_KLINE_URL)
 
     if price_data is None:
         logger.error("Binance price endpoint unreachable")
@@ -167,405 +233,469 @@ def fetch_binance_signal() -> Optional[BinanceSignal]:
     try:
         price = float(price_data["price"])
     except (KeyError, TypeError, ValueError) as exc:
-        logger.error("Failed to parse Binance price: %s", exc)
+        logger.error("Cannot parse Binance price: %s", exc)
         return None
 
-    change_5m: Optional[float] = None
+    change_5m = change_30m = None
     if isinstance(kline_data, list) and len(kline_data) >= 2:
         try:
-            # kline format: [open_time, open, high, low, close, volume, ...]
-            latest_close = float(kline_data[-1][4])
-            prev_close   = float(kline_data[-2][4])
-            if prev_close > 0:
-                change_5m = (latest_close - prev_close) / prev_close * 100
+            latest = float(kline_data[-1][4])
+            prev   = float(kline_data[-2][4])
+            oldest = float(kline_data[0][4])
+            if prev > 0:
+                change_5m  = (latest - prev)   / prev   * 100
+            if oldest > 0:
+                change_30m = (latest - oldest) / oldest * 100
         except (IndexError, TypeError, ValueError) as exc:
-            logger.warning("Failed to compute 5m change: %s", exc)
+            logger.warning("Cannot compute momentum: %s", exc)
 
-    direction, confidence = _classify_direction(change_5m)
-
-    return BinanceSignal(
+    direction, confidence = _classify_momentum(change_5m)
+    return BinanceSnapshot(
         price=price,
         change_5m=change_5m,
+        change_30m=change_30m,
         direction=direction,
         confidence=confidence,
     )
 
 
-def _classify_direction(change_pct: Optional[float]) -> tuple[str, float]:
+def _classify_momentum(change_pct: Optional[float]) -> tuple[str, float]:
     """
-    Classify price movement direction and confidence.
+    Classify price momentum direction and confidence from a % change.
 
     Args:
-        change_pct: Percentage price change. None treated as flat.
+        change_pct: Percentage change. None is treated as flat.
 
     Returns:
-        (direction, confidence) where direction is "UP"/"DOWN"/"FLAT"
-        and confidence is 0.0–1.0 scaled by magnitude.
+        (direction, confidence): direction is "UP"/"DOWN"/"FLAT",
+        confidence is 0.0–1.0 proportional to magnitude.
     """
-    if change_pct is None:
+    if change_pct is None or abs(change_pct) < 0.05:
         return "FLAT", 0.0
 
-    abs_change = abs(change_pct)
-
-    if abs_change < 0.05:
-        return "FLAT", 0.0
-    elif abs_change < 0.10:
+    abs_ch = abs(change_pct)
+    if abs_ch < 0.10:
         confidence = 0.3
-    elif abs_change < 0.20:
+    elif abs_ch < 0.20:
         confidence = 0.6
     else:
-        confidence = min(1.0, abs_change / 0.30)
+        confidence = min(1.0, abs_ch / 0.30)
 
-    direction = "UP" if change_pct > 0 else "DOWN"
-    return direction, confidence
+    return ("UP" if change_pct > 0 else "DOWN"), confidence
 
 
-# -- Opportunity detection -----------------------------------------------------
+# -- CLOB market fetching ------------------------------------------------------
 
-def find_btc_5m_markets(limit: int = 5) -> list[PolymarketMarket]:
+def fetch_btc_sampling_markets() -> list[ClobMarket]:
     """
-    Find active Polymarket BTC Up/Down 5-minute markets.
+    Fetch active BTC markets from the CLOB sampling endpoint.
+
+    Sampling markets are liquid, accepting orders, and eligible for maker rebates.
+    Filters to BTC-related markets with valid YES/NO token prices.
 
     Returns:
-        List of matching markets sorted by volume descending.
+        List of ClobMarket sorted by minimum_order_size ascending.
     """
-    markets = find_markets_for_symbol("BTCUSDT", limit=limit * 3)
-    # Filter to 5-minute directional markets only
-    filtered = [
-        m for m in markets
-        if _is_5m_btc_market(m.question)
-    ]
-    return filtered[:limit]
+    try:
+        client = _build_clob_client()
+        resp   = client.get_sampling_markets()
+    except Exception as exc:
+        logger.error("Failed to fetch sampling markets: %s", exc)
+        return []
+
+    raw_markets = resp.get("data", []) if isinstance(resp, dict) else resp
+    result: list[ClobMarket] = []
+
+    for m in raw_markets:
+        if not m.get("accepting_orders"):
+            continue
+
+        question = m.get("question", "")
+        if not _is_btc_price_market(question):
+            continue
+
+        tokens = m.get("tokens", [])
+        if len(tokens) < 2:
+            continue
+
+        # tokens[0] = YES, tokens[1] = NO (Polymarket convention)
+        yes_tok = next((t for t in tokens if t.get("outcome") == "Yes"), tokens[0])
+        no_tok  = next((t for t in tokens if t.get("outcome") == "No"),  tokens[1])
+
+        try:
+            yes_price = float(yes_tok["price"])
+            no_price  = float(no_tok["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if yes_price <= 0 or no_price <= 0:
+            continue
+
+        result.append(ClobMarket(
+            condition_id=m.get("condition_id", ""),
+            question=question,
+            yes_token_id=str(yes_tok.get("token_id", "")),
+            no_token_id=str(no_tok.get("token_id", "")),
+            yes_price=yes_price,
+            no_price=no_price,
+            accepting_orders=True,
+            minimum_order_size=float(m.get("minimum_order_size", MIN_ORDER_SIZE_USD)),
+        ))
+
+    result.sort(key=lambda m: m.minimum_order_size)
+    logger.info("Fetched %d active BTC sampling markets", len(result))
+    return result
 
 
-def _is_5m_btc_market(question: str) -> bool:
+def _is_btc_price_market(question: str) -> bool:
     """
-    Check if a market question describes a BTC 5-minute Up/Down market.
+    Check if a market question is a BTC price prediction market.
 
     Args:
         question: Market question string.
 
     Returns:
-        True if this looks like a 5-minute BTC directional market.
+        True if question mentions Bitcoin/BTC and a price keyword.
     """
     q = question.lower()
-    has_btc = "bitcoin" in q or "btc" in q
-    has_direction = "up or down" in q or "up/down" in q
-    has_5m = "5m" in q or "5-min" in q or "5 min" in q
-    return has_btc and (has_direction or has_5m)
+    has_btc   = "bitcoin" in q or "btc" in q
+    has_price = any(kw in q for kw in _PRICE_KEYWORDS)
+    return has_btc and has_price
 
 
-def compute_fair_value(signal: BinanceSignal) -> tuple[float, float]:
+# -- Fair value model ----------------------------------------------------------
+
+def compute_fair_value_for_market(
+    market: ClobMarket,
+    snapshot: BinanceSnapshot,
+) -> tuple[float, float]:
     """
-    Estimate fair probability for YES (price goes up) and NO (price goes down).
+    Estimate fair YES/NO probability for a BTC price market.
 
-    Uses Binance momentum as the primary signal. Base is 50/50; adjusted
-    by direction and confidence.
+    Model:
+      - Extract the strike price from the market question (e.g. $100,000).
+      - Compute distance = (current_price - strike) / strike as a normalized
+        measure of how far from resolution the market is.
+      - Use distance + Binance momentum to adjust a base probability.
+      - For "reach X" markets: high current price -> higher YES probability.
+      - For "dip to X" markets: low current price -> higher YES probability.
 
     Args:
-        signal: BinanceSignal from Binance.
+        market: The ClobMarket to evaluate.
+        snapshot: Current Binance price snapshot.
 
     Returns:
-        (yes_fair_value, no_fair_value) both in range 0.0–1.0, sum to 1.0.
+        (yes_fair, no_fair) both in range [0.05, 0.95], summing to 1.0.
     """
-    base = 0.50
-    adjustment = signal.confidence * 0.20   # max 20% shift from momentum
+    strike = _extract_strike_price(market.question)
 
-    if signal.direction == "UP":
-        yes_fair = base + adjustment
-    elif signal.direction == "DOWN":
-        yes_fair = base - adjustment
+    if strike is None or strike <= 0:
+        # No strike found -- use momentum-only model
+        return _momentum_fair_value(snapshot)
+
+    current = snapshot.price
+    is_dip_market = any(
+        kw in market.question.lower()
+        for kw in ["dip", "below", "drop", "fall"]
+    )
+
+    # Normalized distance from strike: positive = current above strike
+    distance = (current - strike) / strike
+
+    if is_dip_market:
+        # YES resolves if price goes DOWN to strike
+        # Current price far above strike -> hard to dip -> lower YES probability
+        base_yes = max(0.05, min(0.95, 0.5 - distance * 2))
     else:
-        yes_fair = base
+        # YES resolves if price goes UP to strike
+        # Current price far below strike -> hard to reach -> lower YES probability
+        base_yes = max(0.05, min(0.95, 0.5 + distance * 2))
 
-    yes_fair = max(0.05, min(0.95, yes_fair))
-    no_fair  = 1.0 - yes_fair
-    return yes_fair, no_fair
+    # Adjust by momentum
+    momentum_adj = snapshot.confidence * 0.10
+    if snapshot.direction == "UP" and not is_dip_market:
+        base_yes += momentum_adj
+    elif snapshot.direction == "DOWN" and is_dip_market:
+        base_yes += momentum_adj
+    elif snapshot.direction == "UP" and is_dip_market:
+        base_yes -= momentum_adj
+    elif snapshot.direction == "DOWN" and not is_dip_market:
+        base_yes -= momentum_adj
 
+    yes_fair = max(0.05, min(0.95, base_yes))
+    return yes_fair, 1.0 - yes_fair
+
+
+def _extract_strike_price(question: str) -> Optional[float]:
+    """
+    Extract a dollar strike price from a market question string.
+
+    Handles formats like "$100,000", "$75k", "100000".
+
+    Args:
+        question: Market question string.
+
+    Returns:
+        Strike price as float, or None if not found.
+    """
+    import re
+
+    # Match $100,000 or $100k or $1.5m patterns
+    patterns = [
+        r"\$([0-9][0-9,]+)",          # $100,000
+        r"\$([0-9]+)k\b",             # $75k
+        r"\$([0-9]+(?:\.[0-9]+)?)m\b", # $1.5m
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, question, re.IGNORECASE)
+        if match:
+            raw = match.group(1).replace(",", "")
+            try:
+                value = float(raw)
+                if "k" in pattern:
+                    value *= 1_000
+                if "m" in pattern:
+                    value *= 1_000_000
+                return value
+            except ValueError:
+                continue
+    return None
+
+
+def _momentum_fair_value(snapshot: BinanceSnapshot) -> tuple[float, float]:
+    """
+    Fallback fair value based purely on Binance momentum.
+
+    Args:
+        snapshot: Current Binance price snapshot.
+
+    Returns:
+        (yes_fair, no_fair) centered around 0.50 with momentum adjustment.
+    """
+    adj = snapshot.confidence * 0.15
+    if snapshot.direction == "UP":
+        yes_fair = 0.50 + adj
+    elif snapshot.direction == "DOWN":
+        yes_fair = 0.50 - adj
+    else:
+        yes_fair = 0.50
+    return max(0.05, min(0.95, yes_fair)), max(0.05, min(0.95, 1.0 - yes_fair))
+
+
+# -- Opportunity detection -----------------------------------------------------
 
 def detect_opportunity(
-    market: PolymarketMarket,
-    signal: BinanceSignal,
+    market: ClobMarket,
+    snapshot: BinanceSnapshot,
     min_edge: float = MIN_EDGE_THRESHOLD,
     max_size: float = MAX_ORDER_SIZE_USD,
 ) -> Optional[MarketOpportunity]:
     """
-    Detect if there is a maker opportunity in a given market.
+    Detect a maker opportunity in a single market.
 
-    Compares Binance-derived fair value against current Polymarket odds.
-    Returns an opportunity only if edge >= min_edge.
+    Computes fair value using the price model, compares against current CLOB
+    odds, and returns an opportunity if edge >= min_edge on either side.
 
     Args:
-        market: The Polymarket market to evaluate.
-        signal: Current Binance price signal.
-        min_edge: Minimum required edge to consider the opportunity.
+        market: The ClobMarket to evaluate.
+        snapshot: Current Binance snapshot.
+        min_edge: Minimum required edge (probability difference) to trade.
         max_size: Maximum order size in USD.
 
     Returns:
         MarketOpportunity if edge found, None otherwise.
     """
-    if market.yes_price is None or market.no_price is None:
-        logger.debug("Skipping market with missing odds: %s", market.question[:50])
-        return None
+    yes_fair, no_fair = compute_fair_value_for_market(market, snapshot)
 
-    yes_fair, no_fair = compute_fair_value(signal)
-
-    # Check YES side edge
     yes_edge = yes_fair - market.yes_price
-    # Check NO side edge
     no_edge  = no_fair  - market.no_price
 
     if yes_edge >= min_edge:
         target_side    = "YES"
+        token_id       = market.yes_token_id
         fair_value     = yes_fair
         market_price   = market.yes_price
         edge           = yes_edge
     elif no_edge >= min_edge:
         target_side    = "NO"
+        token_id       = market.no_token_id
         fair_value     = no_fair
         market_price   = market.no_price
         edge           = no_edge
     else:
-        logger.debug(
-            "No edge found: YES edge=%.3f, NO edge=%.3f (min=%.3f)",
-            yes_edge, no_edge, min_edge,
-        )
         return None
 
-    # Place maker order slightly below fair value to ensure it rests as maker
-    suggested_price = round(max(0.01, fair_value - MAKER_PRICE_OFFSET), 2)
-    suggested_size  = min(max_size, max(MIN_ORDER_SIZE_USD, max_size))
+    order_price = round(max(0.01, min(0.99, fair_value - MAKER_PRICE_OFFSET)), 2)
+    order_size  = max(market.minimum_order_size, min(max_size, max_size))
 
     return MarketOpportunity(
         market=market,
-        binance_signal=signal,
+        signal=snapshot,
         target_side=target_side,
+        target_token_id=token_id,
         fair_value=fair_value,
         market_price=market_price,
         edge=edge,
-        suggested_price=suggested_price,
-        suggested_size=suggested_size,
+        order_price=order_price,
+        order_size=order_size,
     )
 
 
 # -- Order placement -----------------------------------------------------------
-
-def _load_clob_credentials() -> dict:
-    """
-    Load Polymarket CLOB credentials from environment variables.
-
-    Returns:
-        Dict with api_key, secret, passphrase, wallet_address.
-
-    Raises:
-        EnvironmentError: If any required credential is missing.
-    """
-    required = {
-        "api_key":        "POLY_API_KEY",
-        "secret":         "POLY_SECRET",
-        "passphrase":     "POLY_PASSPHRASE",
-        "wallet_address": "POLY_WALLET_ADDRESS",
-    }
-    creds = {}
-    missing = []
-    for field, env_var in required.items():
-        value = os.environ.get(env_var)
-        if not value:
-            missing.append(env_var)
-        else:
-            creds[field] = value
-
-    if missing:
-        raise EnvironmentError(
-            f"Missing required environment variables: {', '.join(missing)}\n"
-            f"See .env.example for setup instructions."
-        )
-    return creds
-
 
 def place_maker_order(
     opportunity: MarketOpportunity,
     dry_run: bool = True,
 ) -> OrderResult:
     """
-    Place a maker limit order on Polymarket CLOB.
+    Place a maker limit order on the Polymarket CLOB.
 
     Args:
         opportunity: The detected market opportunity.
-        dry_run: If True, log the order details but do not submit.
+        dry_run: If True, log the order but do not submit it.
 
     Returns:
-        OrderResult indicating success/failure and order ID.
+        OrderResult with success status and order ID if placed.
     """
     if dry_run:
         logger.info(
             "[DRY RUN] Would place MAKER order:\n"
-            "  Market   : %s\n"
-            "  Side     : %s\n"
-            "  Price    : %.2f\n"
-            "  Size     : $%.2f\n"
-            "  Edge     : %.3f\n"
-            "  Fair val : %.3f  Market: %.3f\n"
-            "  Link     : %s",
-            opportunity.market.question[:60],
+            "  Market     : %s\n"
+            "  Side       : %s\n"
+            "  Token ID   : %s\n"
+            "  Order price: %.2f  (fair=%.3f  market=%.3f  edge=%.3f)\n"
+            "  Order size : $%.2f",
+            opportunity.market.question[:65],
             opportunity.target_side,
-            opportunity.suggested_price,
-            opportunity.suggested_size,
-            opportunity.edge,
+            opportunity.target_token_id[:20] + "...",
+            opportunity.order_price,
             opportunity.fair_value,
             opportunity.market_price,
-            opportunity.market.link,
+            opportunity.edge,
+            opportunity.order_size,
         )
         return OrderResult(
-            success=True,
-            order_id=None,
-            dry_run=True,
-            opportunity=opportunity,
+            success=True, order_id=None, dry_run=True, opportunity=opportunity
         )
 
-    # Live order placement via py-clob-client
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
-    except ImportError:
-        msg = (
-            "py-clob-client is not installed.\n"
-            "Run: pip install py-clob-client"
-        )
+        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.constants import BUY
+    except ImportError as exc:
+        msg = f"py-clob-client import error: {exc}"
         logger.error(msg)
         return OrderResult(
-            success=False,
-            order_id=None,
-            dry_run=False,
-            opportunity=opportunity,
-            error=msg,
+            success=False, order_id=None, dry_run=False,
+            opportunity=opportunity, error=msg,
         )
 
     try:
-        creds = _load_clob_credentials()
-    except EnvironmentError as exc:
-        logger.error("Credential error: %s", exc)
-        return OrderResult(
-            success=False,
-            order_id=None,
-            dry_run=False,
-            opportunity=opportunity,
-            error=str(exc),
-        )
-
-    try:
-        client = ClobClient(
-            host=CLOB_HOST,
-            key=creds["api_key"],
-            secret=creds["secret"],
-            passphrase=creds["passphrase"],
-            signature_type=SIGNATURE_TYPE,
-        )
-
+        client = _build_clob_client()
         order_args = OrderArgs(
-            token_id=opportunity.market.condition_id,
-            price=opportunity.suggested_price,
-            size=opportunity.suggested_size,
+            token_id=opportunity.target_token_id,
+            price=opportunity.order_price,
+            size=opportunity.order_size,
             side=BUY,
         )
-
         response = client.create_and_post_order(order_args)
-        order_id = response.get("orderID") or response.get("id")
-
+        order_id = (
+            response.get("orderID")
+            or response.get("order_id")
+            or response.get("id")
+        )
         logger.info(
-            "Order placed: %s | %s @ %.2f | size=$%.2f | id=%s",
+            "Order placed: %s %s @ %.2f | $%.2f | id=%s",
             opportunity.target_side,
             opportunity.market.question[:40],
-            opportunity.suggested_price,
-            opportunity.suggested_size,
+            opportunity.order_price,
+            opportunity.order_size,
             order_id,
         )
-
         return OrderResult(
-            success=True,
-            order_id=order_id,
-            dry_run=False,
-            opportunity=opportunity,
+            success=True, order_id=order_id, dry_run=False, opportunity=opportunity
         )
 
     except Exception as exc:
         logger.error("Order placement failed: %s", exc)
         return OrderResult(
-            success=False,
-            order_id=None,
-            dry_run=False,
-            opportunity=opportunity,
-            error=str(exc),
+            success=False, order_id=None, dry_run=False,
+            opportunity=opportunity, error=str(exc),
         )
 
 
-# -- Main bot loop -------------------------------------------------------------
+# -- Bot cycle -----------------------------------------------------------------
 
 def run_once(
-    dry_run: bool = True,
+    dry_run: bool   = True,
     max_size: float = MAX_ORDER_SIZE_USD,
     min_edge: float = MIN_EDGE_THRESHOLD,
-    verbose: bool = False,
+    verbose: bool   = False,
 ) -> list[OrderResult]:
     """
-    Execute one full cycle: fetch signal -> find markets -> detect edge -> place orders.
+    Execute one full cycle: fetch -> analyze -> detect -> place.
 
     Args:
         dry_run: If True, do not place real orders.
         max_size: Maximum order size in USD.
         min_edge: Minimum edge threshold to place an order.
-        verbose: If True, log detailed signal information.
+        verbose: If True, log signal and market details.
 
     Returns:
         List of OrderResult for each order attempted this cycle.
     """
     results: list[OrderResult] = []
 
-    # Step 1: Fetch Binance signal
-    signal = fetch_binance_signal()
-    if signal is None:
-        logger.warning("Skipping cycle: Binance signal unavailable")
+    # Step 1: Fetch Binance snapshot
+    snapshot = fetch_binance_snapshot()
+    if snapshot is None:
+        logger.warning("Skipping cycle: Binance unavailable")
         return results
 
     if verbose:
         logger.info(
-            "Binance: BTC=$%.2f  5m=%s%.3f%%  direction=%s  confidence=%.2f",
-            signal.price,
-            "+" if (signal.change_5m or 0) >= 0 else "",
-            signal.change_5m or 0.0,
-            signal.direction,
-            signal.confidence,
+            "Binance: $%.2f  5m=%+.3f%%  30m=%+.3f%%  %s(%.2f)",
+            snapshot.price,
+            snapshot.change_5m or 0,
+            snapshot.change_30m or 0,
+            snapshot.direction,
+            snapshot.confidence,
         )
 
-    # Step 2: Find active BTC 5m markets
-    markets = find_btc_5m_markets(limit=5)
+    # Step 2: Fetch active BTC sampling markets from CLOB
+    markets = fetch_btc_sampling_markets()
     if not markets:
-        logger.info("No active BTC 5m markets found on Polymarket")
+        logger.info("No active BTC markets found")
         return results
 
-    logger.info("Found %d BTC 5m market(s)", len(markets))
+    if verbose:
+        for m in markets:
+            yes_fair, _ = compute_fair_value_for_market(m, snapshot)
+            strike = _extract_strike_price(m.question)
+            logger.info(
+                "  %-65s  YES market=%.3f fair=%.3f  strike=$%s",
+                m.question[:65],
+                m.yes_price,
+                yes_fair,
+                f"{strike:,.0f}" if strike else "?",
+            )
 
     # Step 3: Detect opportunities
     for market in markets:
-        opp = detect_opportunity(market, signal, min_edge=min_edge, max_size=max_size)
+        opp = detect_opportunity(market, snapshot, min_edge=min_edge, max_size=max_size)
         if opp is None:
             continue
 
         logger.info(
-            "Edge detected: %s @ %.3f edge (market=%.3f, fair=%.3f)",
+            "Edge detected: %s | %s @ %.3f edge",
             opp.target_side,
+            market.question[:50],
             opp.edge,
-            opp.market_price,
-            opp.fair_value,
         )
-
-        # Step 4: Place order
         result = place_maker_order(opp, dry_run=dry_run)
         results.append(result)
 
     if not results:
-        logger.info("No opportunities found this cycle (edge < %.3f)", min_edge)
+        logger.info("No opportunities found (edge < %.3f)", min_edge)
 
     return results
 
@@ -580,12 +710,14 @@ def run_loop(
     """
     Run the maker bot continuously on a fixed interval.
 
+    Catches all exceptions per cycle to ensure the loop never crashes.
+
     Args:
         interval: Seconds between cycles.
         dry_run: If True, do not place real orders.
         max_size: Maximum order size per trade in USD.
         min_edge: Minimum required edge to place an order.
-        verbose: If True, print detailed signal information each cycle.
+        verbose: If True, log detailed signal and market information.
     """
     mode = "DRY RUN" if dry_run else "LIVE"
     logger.info(
@@ -605,10 +737,9 @@ def run_loop(
                 verbose=verbose,
             )
         except KeyboardInterrupt:
-            logger.info("Maker bot stopped by user")
+            logger.info("Stopped by user")
             break
         except Exception as exc:
-            # Never crash the loop on unexpected errors -- log and continue
             logger.error("Unexpected error in cycle %d: %s", cycle, exc)
 
         logger.info("Sleeping %ds...", interval)
@@ -621,44 +752,33 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Polymarket Maker Bot\n"
-            "Default mode is --dry-run. Pass --live for real orders.\n"
+            "Default: dry-run. Pass --live to place real orders.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--live",
-        dest="dry_run",
-        action="store_false",
-        default=True,
-        help="Place real orders (default: dry-run only)",
+        "--live", dest="dry_run", action="store_false", default=True,
+        help="Place real orders (default: dry-run)",
     )
     parser.add_argument(
-        "--interval",
-        type=int,
-        default=DEFAULT_INTERVAL_SEC,
+        "--interval", type=int, default=DEFAULT_INTERVAL_SEC,
         help=f"Seconds between cycles (default: {DEFAULT_INTERVAL_SEC})",
     )
     parser.add_argument(
-        "--max-size",
-        type=float,
-        default=MAX_ORDER_SIZE_USD,
-        help=f"Max order size in USD (default: {MAX_ORDER_SIZE_USD})",
+        "--max-size", type=float, default=MAX_ORDER_SIZE_USD,
+        help=f"Max order size USD (default: {MAX_ORDER_SIZE_USD})",
     )
     parser.add_argument(
-        "--min-edge",
-        type=float,
-        default=MIN_EDGE_THRESHOLD,
+        "--min-edge", type=float, default=MIN_EDGE_THRESHOLD,
         help=f"Min edge to place order (default: {MIN_EDGE_THRESHOLD})",
     )
     parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Run one cycle and exit (useful for testing)",
+        "--once", action="store_true",
+        help="Run one cycle and exit",
     )
     parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print detailed signal output each cycle",
+        "--verbose", action="store_true",
+        help="Print detailed signal and market info each cycle",
     )
     args = parser.parse_args()
 
