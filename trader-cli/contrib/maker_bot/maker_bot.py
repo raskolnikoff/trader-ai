@@ -15,6 +15,7 @@ Balance management:
   - Fetches live USDC.e balance from Polygon via web3 before each cycle.
   - Caps total orders per cycle so spending never exceeds available balance.
   - Skips cycle entirely if balance < MIN_ORDER_SIZE_USD.
+  - Fail-safe: on any balance check error, returns 0.0 (halts cycle).
 
 Maker orders pay zero fees and earn a rebate on Polymarket CLOB.
 This bot NEVER places taker orders.
@@ -190,17 +191,25 @@ def fetch_usdc_e_balance(wallet_address: str) -> float:
     Polymarket CLOB only accepts USDC.e as collateral. This check prevents
     over-ordering when the wallet has insufficient on-chain balance.
 
+    Fail-safe behavior:
+      On ANY error (missing web3, RPC failure, bad address, etc.), returns 0.0.
+      The downstream logic in run_once() skips the cycle when balance is below
+      MIN_ORDER_SIZE_USD, so returning 0.0 halts trading safely rather than
+      allowing uncapped orders via float('inf').
+
     Args:
         wallet_address: Ethereum-compatible wallet address (0x...).
 
     Returns:
-        Balance in USD (float). Returns 0.0 on any error.
+        Balance in USD (float). Returns 0.0 on any error (fail-safe).
     """
     try:
         from web3 import Web3
     except ImportError:
-        logger.warning("web3 not installed -- skipping balance check")
-        return float("inf")  # allow trading if web3 unavailable
+        logger.error(
+            "web3 not installed -- HALTING cycle. Run: pip install web3"
+        )
+        return 0.0  # fail-safe: treat as insufficient balance
 
     try:
         w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
@@ -223,8 +232,10 @@ def fetch_usdc_e_balance(wallet_address: str) -> float:
         logger.info("USDC.e balance: $%.4f", balance_usd)
         return balance_usd
     except Exception as exc:
-        logger.warning("Balance check failed: %s -- proceeding without cap", exc)
-        return float("inf")
+        logger.error(
+            "Balance check failed: %s -- HALTING cycle for safety", exc
+        )
+        return 0.0  # fail-safe: treat as insufficient balance
 
 
 # -- CLOB client ---------------------------------------------------------------
