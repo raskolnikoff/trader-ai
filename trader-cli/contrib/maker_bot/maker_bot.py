@@ -11,6 +11,11 @@ Strategy:
   5. Place a limit (maker) order on the underpriced side if edge >= threshold.
   6. Repeat on a configurable interval.
 
+Balance management:
+  - Fetches live USDC.e balance from Polygon via web3 before each cycle.
+  - Caps total orders per cycle so spending never exceeds available balance.
+  - Skips cycle entirely if balance < MIN_ORDER_SIZE_USD.
+
 Maker orders pay zero fees and earn a rebate on Polymarket CLOB.
 This bot NEVER places taker orders.
 
@@ -21,16 +26,17 @@ Safety:
   - All exceptions are caught per cycle; the loop never crashes.
 
 Usage:
-    python maker_bot.py --once --verbose   # dry-run, one cycle
-    python maker_bot.py --verbose          # dry-run, continuous
-    python maker_bot.py --live --max-size 3.0  # live trading
+    python maker_bot.py --once --verbose        # dry-run, one cycle
+    python maker_bot.py --verbose               # dry-run, continuous
+    python maker_bot.py --live --max-size 3.0   # live trading
 
 Requirements:
-    pip install py-clob-client python-dotenv
+    pip install py-clob-client python-dotenv web3
 """
 
 import argparse
 import logging
+import math
 import os
 import re
 import sys
@@ -73,12 +79,19 @@ BINANCE_KLINE_URL: str = (
 CLOB_HOST: str = "https://clob.polymarket.com"
 CHAIN_ID: int  = 137  # Polygon
 
+# USDC.e (bridged USDC) contract on Polygon -- required by Polymarket CLOB
+USDC_E_ADDRESS: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+POLYGON_RPC: str    = "https://polygon-bor-rpc.publicnode.com"
+
 DEFAULT_INTERVAL_SEC: int  = 60
 MAX_ORDER_SIZE_USD: float  = 5.0
 MIN_ORDER_SIZE_USD: float  = 5.0   # Polymarket sampling market minimum
 MIN_EDGE_THRESHOLD: float  = 0.04  # 4% minimum mispricing to place order
 MAKER_PRICE_OFFSET: float  = 0.01  # post maker 1 cent below fair value
 HTTP_TIMEOUT_SEC: int      = 8
+
+# Reserve fraction of balance -- never spend 100% to leave room for gas
+BALANCE_RESERVE_RATIO: float = 0.90  # use at most 90% of available balance
 
 # Keywords indicating this is a BTC price prediction market
 _PRICE_KEYWORDS: list[str] = [
@@ -88,9 +101,7 @@ _PRICE_KEYWORDS: list[str] = [
 # Keywords indicating the market resolves YES if price goes DOWN
 _DIP_KEYWORDS: list[str] = ["dip", "below", "drop", "fall"]
 
-# Sigmoid scaling factor for distance->probability conversion.
-# Larger = faster transition from 0 to 1 (more sensitive to distance).
-# At k=3: distance of 0.3 (30% away from strike) gives ~75% probability.
+# Sigmoid scaling factor for distance->probability conversion
 _SIGMOID_SCALE: float = 3.0
 
 
@@ -100,18 +111,15 @@ _SIGMOID_SCALE: float = 3.0
 class BinanceSnapshot:
     """Current BTC price and momentum from Binance."""
     price: float
-    change_5m: Optional[float]   # % change over last 5m candle
-    change_30m: Optional[float]  # % change over last 30m (6 candles)
-    direction: str               # "UP", "DOWN", or "FLAT"
-    confidence: float            # 0.0 – 1.0
+    change_5m: Optional[float]
+    change_30m: Optional[float]
+    direction: str
+    confidence: float
 
 
 @dataclass
 class ClobMarket:
-    """
-    A Polymarket market fetched from the CLOB API with real-time token prices.
-    More reliable than Gamma API which often returns None for outcomePrices.
-    """
+    """A Polymarket market fetched from the CLOB API with real-time token prices."""
     condition_id: str
     question: str
     yes_token_id: str
@@ -127,13 +135,13 @@ class MarketOpportunity:
     """A detected mispricing between our fair-value model and Polymarket odds."""
     market: ClobMarket
     signal: BinanceSnapshot
-    target_side: str       # "YES" or "NO"
-    target_token_id: str   # CLOB token_id for the target side
-    fair_value: float      # our estimated probability (0–1)
-    market_price: float    # current Polymarket price for target side
-    edge: float            # fair_value - market_price (positive = underpriced)
-    order_price: float     # limit price to post as maker
-    order_size: float      # USD size
+    target_side: str
+    target_token_id: str
+    fair_value: float
+    market_price: float
+    edge: float
+    order_price: float
+    order_size: float
 
 
 @dataclass
@@ -171,6 +179,52 @@ def _fetch_json(url: str) -> Optional[dict | list]:
     except Exception as exc:
         logger.warning("HTTP fetch failed [%s]: %s", url[:60], exc)
         return None
+
+
+# -- Balance check (on-chain) --------------------------------------------------
+
+def fetch_usdc_e_balance(wallet_address: str) -> float:
+    """
+    Fetch the USDC.e (bridged USDC on Polygon) balance of a wallet via web3.
+
+    Polymarket CLOB only accepts USDC.e as collateral. This check prevents
+    over-ordering when the wallet has insufficient on-chain balance.
+
+    Args:
+        wallet_address: Ethereum-compatible wallet address (0x...).
+
+    Returns:
+        Balance in USD (float). Returns 0.0 on any error.
+    """
+    try:
+        from web3 import Web3
+    except ImportError:
+        logger.warning("web3 not installed -- skipping balance check")
+        return float("inf")  # allow trading if web3 unavailable
+
+    try:
+        w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+        abi = [
+            {
+                "inputs": [{"name": "account", "type": "address"}],
+                "name": "balanceOf",
+                "outputs": [{"type": "uint256"}],
+                "stateMutability": "view",
+                "type": "function",
+            }
+        ]
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=abi
+        )
+        raw = contract.functions.balanceOf(
+            Web3.to_checksum_address(wallet_address)
+        ).call()
+        balance_usd = raw / 1e6  # USDC.e has 6 decimals
+        logger.info("USDC.e balance: $%.4f", balance_usd)
+        return balance_usd
+    except Exception as exc:
+        logger.warning("Balance check failed: %s -- proceeding without cap", exc)
+        return float("inf")
 
 
 # -- CLOB client ---------------------------------------------------------------
@@ -268,8 +322,7 @@ def _classify_momentum(change_pct: Optional[float]) -> tuple[str, float]:
         change_pct: % price change. None treated as flat.
 
     Returns:
-        (direction, confidence) where direction is "UP"/"DOWN"/"FLAT"
-        and confidence is 0.0–1.0 proportional to move magnitude.
+        (direction, confidence) where direction is UP/DOWN/FLAT.
     """
     if change_pct is None or abs(change_pct) < 0.05:
         return "FLAT", 0.0
@@ -290,9 +343,6 @@ def _classify_momentum(change_pct: Optional[float]) -> tuple[str, float]:
 def fetch_btc_sampling_markets() -> list[ClobMarket]:
     """
     Fetch active BTC price markets from the CLOB sampling endpoint.
-
-    Sampling markets are liquid, maker-rebate eligible, and accepting orders.
-    Filters to BTC markets with valid YES/NO token prices.
 
     Returns:
         List of ClobMarket sorted by minimum_order_size ascending.
@@ -347,12 +397,7 @@ def fetch_btc_sampling_markets() -> list[ClobMarket]:
 
 
 def _is_btc_price_market(question: str) -> bool:
-    """
-    Return True if question is a BTC price prediction market.
-
-    Args:
-        question: Market question string.
-    """
+    """Return True if question is a BTC price prediction market."""
     q = question.lower()
     return ("bitcoin" in q or "btc" in q) and any(kw in q for kw in _PRICE_KEYWORDS)
 
@@ -363,21 +408,18 @@ def _extract_strike_price(question: str) -> Optional[float]:
     """
     Extract the dollar strike price from a market question string.
 
-    Supports formats: $100,000  $75,000  $150k  $1m  $1.5m
-    The pattern matching order matters: try the most specific (with suffix)
-    before falling back to plain numbers, to avoid partial matches.
+    Supports: $100,000  $150k  $1.5m
 
     Args:
         question: Market question string.
 
     Returns:
-        Strike price as float (USD), or None if no price found.
+        Strike price as float (USD), or None if not found.
     """
-    # Order: try suffixed patterns first to avoid $150k matching as $150
     patterns: list[tuple[str, float]] = [
-        (r"\$([0-9]+(?:\.[0-9]+)?)\s*m\b", 1_000_000),  # $1.5m -> 1_500_000
-        (r"\$([0-9]+(?:\.[0-9]+)?)\s*k\b", 1_000),      # $150k -> 150_000
-        (r"\$([0-9][0-9,]{2,})",           1),           # $100,000 or $100000
+        (r"\$([0-9]+(?:\.[0-9]+)?)\s*m\b", 1_000_000),
+        (r"\$([0-9]+(?:\.[0-9]+)?)\s*k\b", 1_000),
+        (r"\$([0-9][0-9,]{2,})",           1),
     ]
     for pattern, multiplier in patterns:
         match = re.search(pattern, question, re.IGNORECASE)
@@ -398,14 +440,8 @@ def compute_fair_value_for_market(
     """
     Estimate fair YES/NO probability for a BTC price market.
 
-    Model:
-      - Extract the strike price from the question.
-      - Use a sigmoid function on normalized distance to avoid 0.05/0.95 clamping.
-        sigmoid(x) = 1 / (1 + exp(-k * x))
-        where x = (current - strike) / strike  (positive = current above strike)
-      - For "reach X" markets: current > strike -> more likely to resolve YES.
-      - For "dip to X" markets: current < strike -> more likely to resolve YES.
-      - Apply a small momentum adjustment (+/- up to 5%).
+    Uses sigmoid function on normalized distance from strike price,
+    with a small momentum adjustment.
 
     Args:
         market: ClobMarket to evaluate.
@@ -414,23 +450,16 @@ def compute_fair_value_for_market(
     Returns:
         (yes_fair, no_fair) both in [0.05, 0.95], summing to 1.0.
     """
-    import math
-
     strike = _extract_strike_price(market.question)
     if strike is None or strike <= 0:
         return _momentum_fair_value(snapshot)
 
-    current      = snapshot.price
-    is_dip       = any(kw in market.question.lower() for kw in _DIP_KEYWORDS)
-    distance     = (current - strike) / strike  # positive = current above strike
-
-    # Sigmoid maps distance to a smooth probability curve
-    # For "reach X": current above strike -> higher YES probability
-    # For "dip to X": current below strike -> higher YES probability
-    signed_dist  = distance if not is_dip else -distance
+    current     = snapshot.price
+    is_dip      = any(kw in market.question.lower() for kw in _DIP_KEYWORDS)
+    distance    = (current - strike) / strike
+    signed_dist = distance if not is_dip else -distance
     yes_fair_raw = 1.0 / (1.0 + math.exp(-_SIGMOID_SCALE * signed_dist))
 
-    # Small momentum adjustment (max ±5%)
     momentum_adj = snapshot.confidence * 0.05
     if snapshot.direction == "UP" and not is_dip:
         yes_fair_raw += momentum_adj
@@ -446,16 +475,7 @@ def compute_fair_value_for_market(
 
 
 def _momentum_fair_value(snapshot: BinanceSnapshot) -> tuple[float, float]:
-    """
-    Fallback fair value when no strike price can be extracted.
-    Centers at 50/50 and adjusts by momentum confidence.
-
-    Args:
-        snapshot: Current Binance price snapshot.
-
-    Returns:
-        (yes_fair, no_fair) both in [0.05, 0.95].
-    """
+    """Fallback fair value based purely on Binance momentum."""
     adj = snapshot.confidence * 0.10
     if snapshot.direction == "UP":
         yes_fair = 0.50 + adj
@@ -477,9 +497,6 @@ def detect_opportunity(
 ) -> Optional[MarketOpportunity]:
     """
     Detect a maker opportunity in a single market.
-
-    Compares our fair-value estimate against current CLOB odds.
-    Returns an opportunity if edge >= min_edge on either side.
 
     Args:
         market: The ClobMarket to evaluate.
@@ -565,7 +582,6 @@ def place_maker_order(
 
     try:
         from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.constants import BUY
     except ImportError as exc:
         msg = f"py-clob-client import error: {exc}"
         logger.error(msg)
@@ -580,7 +596,7 @@ def place_maker_order(
             token_id=opportunity.target_token_id,
             price=opportunity.order_price,
             size=opportunity.order_size,
-            side=BUY,
+            side="BUY",  # side is plain string in current py-clob-client
         )
         response = client.create_and_post_order(order_args)
         order_id = (
@@ -617,7 +633,12 @@ def run_once(
     verbose: bool   = False,
 ) -> list[OrderResult]:
     """
-    Execute one full cycle: fetch -> analyze -> detect edge -> place orders.
+    Execute one full cycle: balance check -> fetch -> analyze -> detect -> place.
+
+    Balance management:
+      - Reads live USDC.e balance from Polygon.
+      - Caps number of orders so total spend <= balance * BALANCE_RESERVE_RATIO.
+      - Skips cycle if balance < MIN_ORDER_SIZE_USD.
 
     Args:
         dry_run: If True, do not place real orders.
@@ -630,6 +651,28 @@ def run_once(
     """
     results: list[OrderResult] = []
 
+    # -- Step 1: Balance check -------------------------------------------------
+    wallet = os.environ.get("POLY_WALLET_ADDRESS", "")
+    if wallet and not dry_run:
+        balance   = fetch_usdc_e_balance(wallet)
+        spendable = balance * BALANCE_RESERVE_RATIO
+        if spendable < MIN_ORDER_SIZE_USD:
+            logger.warning(
+                "Balance too low to trade: $%.4f (need $%.2f). Skipping cycle.",
+                balance, MIN_ORDER_SIZE_USD,
+            )
+            return results
+        max_orders = int(spendable // max_size)
+        logger.info(
+            "Balance $%.4f  spendable $%.4f  max_orders=%d",
+            balance, spendable, max_orders,
+        )
+    else:
+        max_orders = 999  # dry-run: no limit
+        if dry_run:
+            logger.info("DRY RUN: skipping balance check")
+
+    # -- Step 2: Binance snapshot ----------------------------------------------
     snapshot = fetch_binance_snapshot()
     if snapshot is None:
         logger.warning("Skipping cycle: Binance unavailable")
@@ -645,6 +688,7 @@ def run_once(
             snapshot.confidence,
         )
 
+    # -- Step 3: Fetch markets -------------------------------------------------
     markets = fetch_btc_sampling_markets()
     if not markets:
         logger.info("No active BTC markets found")
@@ -662,10 +706,19 @@ def run_once(
                 f"{strike:,.0f}" if strike else "?",
             )
 
+    # -- Step 4: Detect and place (respecting max_orders cap) ------------------
+    orders_placed = 0
     for market in markets:
+        if orders_placed >= max_orders:
+            logger.info(
+                "Order cap reached (%d). Remaining markets skipped.", max_orders
+            )
+            break
+
         opp = detect_opportunity(market, snapshot, min_edge=min_edge, max_size=max_size)
         if opp is None:
             continue
+
         logger.info(
             "Edge detected: %s | %s @ %.3f",
             opp.target_side,
@@ -674,6 +727,8 @@ def run_once(
         )
         result = place_maker_order(opp, dry_run=dry_run)
         results.append(result)
+        if result.success:
+            orders_placed += 1
 
     if not results:
         logger.info("No opportunities found (edge < %.3f)", min_edge)
