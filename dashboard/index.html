@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>trader-ai — live</title>
+<meta name="description" content="Local-first AI trading dashboard. Polymarket maker bot, Claude-powered." />
+<link rel="preconnect" href="https://rsms.me/" />
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+
+<!-- Grain overlay for texture -->
+<div class="grain" aria-hidden="true"></div>
+
+<!-- Header -->
+<header class="site-header">
+  <div class="brand">
+    <svg class="brand-mark" width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">
+      <circle cx="10" cy="10" r="3" fill="currentColor"/>
+      <circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1" opacity="0.4"/>
+      <circle cx="10" cy="10" r="9" fill="none" stroke="currentColor" stroke-width="1" opacity="0.15"/>
+    </svg>
+    <span class="brand-name">trader-ai</span>
+    <span class="brand-divider">/</span>
+    <span class="brand-sub">live</span>
+  </div>
+
+  <div class="header-meta">
+    <span class="status" id="status-indicator">
+      <span class="status-dot" data-state="connecting"></span>
+      <span class="status-text" id="status-text">connecting</span>
+    </span>
+    <span class="header-divider">·</span>
+    <span class="mono muted" id="last-update">--:--:--</span>
+  </div>
+</header>
+
+<!-- Main grid -->
+<main class="grid">
+
+  <!-- Row 1: price + wallet -->
+  <section class="card card-price" aria-labelledby="price-label">
+    <header class="card-head">
+      <span class="card-label" id="price-label">BTC/USD</span>
+      <span class="card-source mono muted">Binance</span>
+    </header>
+    <div class="metric-xl mono tnum" id="btc-price">$--,---</div>
+    <div class="metric-delta" id="btc-delta">
+      <span class="delta-pill mono tnum" data-sign="flat">+0.00%</span>
+      <span class="muted">5m</span>
+    </div>
+  </section>
+
+  <section class="card card-wallet" aria-labelledby="wallet-label">
+    <header class="card-head">
+      <span class="card-label" id="wallet-label">Wallet</span>
+      <span class="card-source mono muted">Polygon · USDC.e</span>
+    </header>
+    <div class="wallet-grid">
+      <div>
+        <div class="muted">Balance</div>
+        <div class="metric-lg mono tnum" id="usdce-balance">$--.--</div>
+      </div>
+      <div>
+        <div class="muted">Positions</div>
+        <div class="metric-lg mono tnum" id="pos-value">$--.--</div>
+      </div>
+      <div>
+        <div class="muted">Open orders</div>
+        <div class="metric-lg mono tnum" id="open-orders">--</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Row 2: markets scan -->
+  <section class="card card-wide card-markets" aria-labelledby="markets-label">
+    <header class="card-head">
+      <span class="card-label" id="markets-label">Maker bot · current scan</span>
+      <span class="card-source mono muted">
+        edge threshold: <span id="edge-threshold">4.0%</span>
+      </span>
+    </header>
+    <div class="table-wrap" role="region" aria-label="Markets" tabindex="0">
+      <table class="markets-table">
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th class="num">Mkt</th>
+            <th class="num">Fair</th>
+            <th class="num">Edge</th>
+            <th class="num">Liquidity</th>
+          </tr>
+        </thead>
+        <tbody id="markets-body">
+          <tr class="row-empty"><td colspan="5">waiting for first scan…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Row 3: activity + optional TV chart -->
+  <section class="card card-activity" aria-labelledby="activity-label">
+    <header class="card-head">
+      <span class="card-label" id="activity-label">Recent activity</span>
+      <span class="card-source mono muted" id="activity-count">0 events</span>
+    </header>
+    <ul class="activity" id="activity-list">
+      <li class="activity-empty muted">no events yet</li>
+    </ul>
+  </section>
+
+  <section class="card card-tv" aria-labelledby="tv-label">
+    <header class="card-head">
+      <span class="card-label" id="tv-label">TV chart</span>
+      <span class="card-source mono muted" id="tv-state">not connected</span>
+    </header>
+    <div class="tv-body" id="tv-body">
+      <div class="muted">TradingView Desktop not running.<br/>
+        Launch with <span class="mono">--remote-debugging-port=9222</span> to enable.
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <span class="muted mono">
+    <a href="https://github.com/raskolnikoff/trader-ai" target="_blank" rel="noopener">github.com/raskolnikoff/trader-ai</a>
+    · local-first · no cloud
+  </span>
+</footer>
+
+<script src="./app.js"></script>
+</body>
+</html>
