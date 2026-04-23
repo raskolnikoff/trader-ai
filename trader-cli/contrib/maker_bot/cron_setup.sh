@@ -8,8 +8,9 @@
 #
 # Features:
 #   - Auto-detects anaconda3 / miniconda3 / homebrew miniconda
+#   - Auto-detects flock (Linux) or falls back to mkdir-based locking (macOS)
 #   - Loads .env automatically before each cycle
-#   - flock prevents overlapping runs
+#   - Prevents overlapping cron runs
 #   - Daily logrotate at 4am, keeps 14 days of gzipped logs
 #
 # The primary cron job:
@@ -36,6 +37,7 @@ ENV_FILE="${REPO_ROOT}/.env"
 LOG_DIR="${HOME}/logs"
 LOG_FILE="${LOG_DIR}/maker_bot.log"
 LOCK_FILE="/tmp/maker_bot_trader_ai.lock"
+LOCK_DIR="/tmp/maker_bot_trader_ai.lockdir"
 CONDA_ENV="${CONDA_ENV_OVERRIDE:-trader-ai}"
 CRON_TAG="# maker_bot_trader_ai"
 LOGROTATE_TAG="# maker_bot_logrotate"
@@ -60,12 +62,46 @@ else
     exit 1
 fi
 
+# -- Detect flock (Linux) or choose fallback (macOS) --------------------------
+#
+# macOS does not ship with flock. Homebrew's `flock` package provides it at
+# /opt/homebrew/bin/flock (Apple Silicon) or /usr/local/bin/flock (Intel).
+# If no flock is found, we fall back to mkdir-based locking, which is atomic
+# on all POSIX filesystems and needs no external dependency.
+
+FLOCK_BIN=""
+for candidate in \
+    "${FLOCK_OVERRIDE:-}" \
+    "/usr/bin/flock" \
+    "/usr/local/bin/flock" \
+    "/opt/homebrew/bin/flock" \
+    "$(command -v flock 2>/dev/null || true)"
+do
+    if [ -n "${candidate}" ] && [ -x "${candidate}" ]; then
+        FLOCK_BIN="${candidate}"
+        break
+    fi
+done
+
 # -- Build cron commands -------------------------------------------------------
 
-# Primary: every 2 minutes, with flock + .env loading + conda activation
-# .env sourcing uses `set -a` so all declared vars are auto-exported.
-# The trailing `|| true` on the env source prevents cron failure if .env is missing.
-CRON_CMD="*/2 * * * * /usr/bin/flock -n ${LOCK_FILE} -c 'cd ${REPO_ROOT} && set -a && [ -f ${ENV_FILE} ] && source ${ENV_FILE} || true; set +a && source ${CONDA_SH} && conda activate ${CONDA_ENV} && python ${BOT_SCRIPT} --live --once >> ${LOG_FILE} 2>&1' ${CRON_TAG}"
+# The inner command: cd to repo, source .env, activate conda, run the bot.
+# Shared by both lock strategies.
+INNER_CMD="cd ${REPO_ROOT} && set -a && [ -f ${ENV_FILE} ] && source ${ENV_FILE} || true; set +a && source ${CONDA_SH} && conda activate ${CONDA_ENV} && python ${BOT_SCRIPT} --live --once >> ${LOG_FILE} 2>&1"
+
+if [ -n "${FLOCK_BIN}" ]; then
+    # flock-based locking (Linux, or macOS with Homebrew flock installed)
+    CRON_CMD="*/2 * * * * ${FLOCK_BIN} -n ${LOCK_FILE} -c '${INNER_CMD}' ${CRON_TAG}"
+    LOCK_STRATEGY="flock (${FLOCK_BIN})"
+else
+    # mkdir-based locking (portable fallback, works on vanilla macOS).
+    # mkdir on an existing directory fails atomically, so only one process at
+    # a time passes through. We rmdir at the end, and trap EXIT to clean up
+    # if the command dies. The `mkdir … || exit 0` path makes overlapping
+    # invocations exit quietly without spawning a second bot.
+    CRON_CMD="*/2 * * * * /bin/bash -c 'mkdir ${LOCK_DIR} 2>/dev/null || exit 0; trap \"rmdir ${LOCK_DIR}\" EXIT; ${INNER_CMD}' ${CRON_TAG}"
+    LOCK_STRATEGY="mkdir fallback (no flock found; install with: brew install flock)"
+fi
 
 # Secondary: daily 4am logrotate, keep 14 days of gzipped logs
 LOGROTATE_CMD="0 4 * * * [ -f \"${LOG_FILE}\" ] && mv \"${LOG_FILE}\" \"${LOG_FILE}.\$(date +\%Y\%m\%d)\" && gzip \"${LOG_FILE}.\$(date +\%Y\%m\%d)\" && find \"\$(dirname ${LOG_FILE})\" -name \"maker_bot.log.*.gz\" -mtime +14 -delete ${LOGROTATE_TAG}"
@@ -94,9 +130,9 @@ install_cron() {
     echo "  Logrotate (daily 4am, keep 14 days):"
     echo "    ${LOGROTATE_CMD}"
     echo ""
-    echo "Log file: ${LOG_FILE}"
-    echo "Lock file: ${LOCK_FILE}"
-    echo "Conda env: ${CONDA_ENV}  (conda.sh: ${CONDA_SH})"
+    echo "Log file:       ${LOG_FILE}"
+    echo "Lock strategy:  ${LOCK_STRATEGY}"
+    echo "Conda env:      ${CONDA_ENV}  (conda.sh: ${CONDA_SH})"
     echo ""
     echo "macOS users: grant Full Disk Access to /usr/sbin/cron in System Settings."
     echo ""
@@ -107,8 +143,10 @@ install_cron() {
 remove_cron() {
     (crontab -l 2>/dev/null | grep -v "${CRON_TAG}" | grep -v "${LOGROTATE_TAG}") | crontab - || true
     rm -f "${LOCK_FILE}"
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
     echo "Removed bot + logrotate cron entries."
-    echo "Lock file cleared: ${LOCK_FILE}"
+    echo "Lock file cleared:      ${LOCK_FILE}"
+    echo "Lock directory cleared: ${LOCK_DIR}"
 }
 
 status_cron() {
@@ -126,11 +164,16 @@ status_cron() {
         echo "  (none)"
     fi
     echo ""
-    echo "Lock file:"
+    echo "Lock strategy: ${LOCK_STRATEGY}"
+    echo "Lock state:"
     if [ -f "${LOCK_FILE}" ]; then
-        echo "  ${LOCK_FILE} (exists)"
-    else
-        echo "  ${LOCK_FILE} (not present - OK)"
+        echo "  ${LOCK_FILE} (flock file exists)"
+    fi
+    if [ -d "${LOCK_DIR}" ]; then
+        echo "  ${LOCK_DIR} (mkdir lock held - a cycle is running)"
+    fi
+    if [ ! -f "${LOCK_FILE}" ] && [ ! -d "${LOCK_DIR}" ]; then
+        echo "  no lock held (OK - ready for next cycle)"
     fi
     echo ""
     echo "Running processes:"
@@ -154,6 +197,7 @@ case "${1:-}" in
         echo "Environment overrides:"
         echo "  CONDA_ENV_OVERRIDE  - use a different conda env name (default: trader-ai)"
         echo "  CONDA_SH_OVERRIDE   - use a different conda.sh path"
+        echo "  FLOCK_OVERRIDE      - use a specific flock binary (default: auto-detect)"
         exit 1
         ;;
 esac
