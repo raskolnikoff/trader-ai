@@ -258,8 +258,7 @@ trader-ai/
 │   └── app.js
 ├── docs/
 │   ├── architecture.svg           # Light/dark-aware architecture diagram
-│   ├── webhook_setup.md           # ngrok + TV alert setup (Pro+ plan)
-│   └── linkedin_post.md           # Announcement post templates
+│   └── webhook_setup.md           # ngrok + TV alert setup (Pro+ plan)
 ├── pine/
 │   └── polymarket_overlay.pine    # Reference Pine Script (Pro+ plan, optional)
 ├── scripts/
