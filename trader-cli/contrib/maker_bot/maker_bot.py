@@ -98,13 +98,24 @@ from typing import Optional
 
 # -- Path setup ----------------------------------------------------------------
 
+# This file lives at:
+#   <repo_root>/trader-cli/contrib/maker_bot/maker_bot.py
+# so three `.parent` hops reach the repo root, not four. (Four hops would go
+# one level above the repo, to whatever directory the repo is checked out in.)
 _ROOT = Path(__file__).parent.parent.parent.parent
 _CLI  = Path(__file__).parent.parent.parent
 
-_dotenv_path = _ROOT / ".env"
+# Try the nominal location first; if it doesn't exist, try one level up
+# (some checkouts place the repo one directory deeper than expected).
+_dotenv_path = _CLI.parent / ".env"            # trader-ai/.env (correct)
+_fallback_dotenv_path = _ROOT / ".env"         # legacy behaviour, one level higher
+
 if _dotenv_path.exists():
     from dotenv import load_dotenv
     load_dotenv(_dotenv_path, override=True)
+elif _fallback_dotenv_path.exists():
+    from dotenv import load_dotenv
+    load_dotenv(_fallback_dotenv_path, override=True)
 
 # Ensure both trader-cli/ (for `contrib.maker_bot.*`) and the maker_bot
 # directory itself (for sibling imports when run as a script) are on sys.path.

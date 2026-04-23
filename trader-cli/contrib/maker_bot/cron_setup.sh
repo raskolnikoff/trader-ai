@@ -24,7 +24,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+# Repo root is three levels up from this script:
+#   trader-ai/trader-cli/contrib/maker_bot/cron_setup.sh
+#   -> trader-ai/trader-cli/contrib/maker_bot
+#   -> trader-ai/trader-cli/contrib
+#   -> trader-ai/trader-cli
+#   -> trader-ai                          (this is the repo root)
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 BOT_SCRIPT="${SCRIPT_DIR}/maker_bot.py"
 ENV_FILE="${REPO_ROOT}/.env"
 LOG_DIR="${HOME}/logs"
