@@ -16,17 +16,25 @@ Strategy:
 Fair-value model (v2 — PR #21):
   When end_date is available, we price the market as a "barrier touch"
   probability under geometric Brownian motion (GBM) with constant volatility.
-  For a "reach $K by date T" market:
+  For an upper barrier K > S_0, using the running-maximum distribution of a
+  drifted arithmetic Brownian motion X_t = ln(S_t / S_0) with drift
+  mu = r - sigma^2/2 and diffusion sigma, and setting k = ln(K/S_0) > 0:
 
-      P(max_{t<=T} S_t >= K) = Phi(d1) + (K/S_0)^(2r/sigma^2 - 1) * Phi(d2)
+      P(max_{t<=T} X_t >= k)
+        = Phi((-k + mu*T) / (sigma*sqrt(T)))
+          + exp(2*mu*k / sigma^2) * Phi((-k - mu*T) / (sigma*sqrt(T)))
+
+  This is the standard BM-with-drift running-maximum formula; see any text
+  on barrier options or Borodin & Salminen. Verified numerically against a
+  Monte Carlo simulation.
 
   Parameters:
     sigma = GBM_VOL_ANNUAL (default 0.60, representative BTC realised vol)
-    r     = 0                (short horizon, negligible drift)
+    r     = 0              (short horizon, negligible drift)
     T     = (end_date - now) in years, clamped to [1/365, 3.0]
   Dip markets (`S_0 > K` and "dip/below/drop/fall" in question) are priced as
-  P(min_{t<=T} S_t <= K), which by symmetry equals the reach probability with
-  S_0 and K swapped.
+  P(min_{t<=T} S_t <= K), computed via the log-price symmetry
+  down_touch(S_0, K) = up_touch(K, S_0).
 
   When end_date is missing, the model falls back to the previous sigmoid
   heuristic — preserving backwards compatibility with sources that lack a
@@ -83,7 +91,7 @@ import sys
 import time
 import urllib.request
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -571,7 +579,7 @@ def _extract_strike_price(question: str) -> Optional[float]:
     return None
 
 
-# -- Fair-value model: GBM barrier-touch probability ---------------------------
+# -- Fair-value model: BM running-maximum touch probability --------------------
 
 def _norm_cdf(x: float) -> float:
     """Standard normal CDF via math.erf (no scipy dependency)."""
@@ -587,35 +595,38 @@ def _touch_probability_up(
 ) -> float:
     """
     Probability that a GBM process starting at S_0 touches the upper barrier K
-    at any time within [0, T]. Reflection-principle closed form:
+    at any time within [0, T].
 
-        P = Phi(d1) + (K/S_0)^(2r/sigma^2 - 1) * Phi(d2)
+    Derivation (log-price running maximum):
+      Let X_t = ln(S_t / S_0). Under GBM, X_t is a Brownian motion with
+      drift mu = r - sigma^2/2 and diffusion sigma. We want
+        P(max_{0<=t<=T} X_t >= b)   where b = ln(K/S_0) > 0.
+      The running-max distribution of drifted BM gives:
+        P(max >= b)
+          = Phi((-b + mu*T) / (sigma*sqrt(T)))
+          + exp(2*mu*b / sigma^2) * Phi((-b - mu*T) / (sigma*sqrt(T)))
+      See Borodin & Salminen (2002), or any barrier-option text.
 
-    where
-        d1 = [ln(S_0/K) + (r - sigma^2/2)T] / (sigma * sqrt(T))
-        d2 = d1 - 2 ln(S_0/K) / (sigma * sqrt(T))
-
-    Only meaningful when K > S_0. If K <= S_0 the barrier has already been
-    touched, so we return 1.0.
+    If K <= S_0 the barrier has already been touched at t=0, so we return 1.0.
+    Degenerate inputs (non-positive parameters) return 0.5 as a safe middle.
     """
     if s0 <= 0 or k <= 0 or t_years <= 0 or sigma <= 0:
         return 0.5
     if k <= s0:
         return 1.0
 
+    mu = r - 0.5 * sigma * sigma            # log-price drift
     sqrt_t = math.sqrt(t_years)
-    vol_adj = sigma * sqrt_t
-    log_ratio = math.log(s0 / k)  # negative since k > s0
+    vol_t = sigma * sqrt_t
+    b = math.log(k / s0)                    # > 0
 
-    d1 = (log_ratio + (r - 0.5 * sigma * sigma) * t_years) / vol_adj
-    d2 = d1 - (2.0 * log_ratio) / vol_adj
+    term_a = _norm_cdf((-b + mu * t_years) / vol_t)
+    term_b = math.exp(2.0 * mu * b / (sigma * sigma)) * \
+             _norm_cdf((-b - mu * t_years) / vol_t)
 
-    # Exponent (2r/sigma^2 - 1). With r=0, this is -1, so the second term
-    # collapses to (s0/k) * Phi(d2).
-    exponent = (2.0 * r / (sigma * sigma)) - 1.0
-    ratio_term = (k / s0) ** exponent
-
-    return _norm_cdf(d1) + ratio_term * _norm_cdf(d2)
+    prob = term_a + term_b
+    # Numerical safety; the formula is a probability so should be in [0, 1].
+    return max(0.0, min(1.0, prob))
 
 
 def _touch_probability_down(
@@ -627,7 +638,7 @@ def _touch_probability_down(
 ) -> float:
     """
     Probability that a GBM process starting at S_0 touches the lower barrier K
-    within [0, T]. By reflection symmetry this equals the upper-touch
+    within [0, T]. By log-price symmetry this equals the upper-touch
     probability with S_0 and K swapped.
     """
     if s0 <= 0 or k <= 0 or t_years <= 0 or sigma <= 0:
