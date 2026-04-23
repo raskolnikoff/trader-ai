@@ -4,12 +4,23 @@ Polymarket Maker Bot.
 
 Strategy:
   1. Fetch current BTC price and momentum from Binance (5m candles).
-  2. Fetch active BTC markets from Polymarket CLOB sampling endpoint.
+  2. Fetch active BTC markets from Polymarket CLOB sampling endpoint
+     AND/OR the public Gamma API (for weekly/monthly short-term markets).
   3. For each market, compute a fair-value probability using Binance price
      relative to the market's resolution threshold (strike price).
   4. Compare fair value against current Polymarket odds to detect mispricing.
   5. Place a limit (maker) order on the underpriced side if edge >= threshold.
   6. Repeat on a configurable interval.
+
+Market sourcing:
+  --source clob    : CLOB sampling endpoint only (original behavior).
+  --source gamma   : Gamma API only (short-term markets, public, no auth).
+  --source all     : Merge both sources, deduplicated by condition_id. DEFAULT.
+
+Horizon filter (Gamma only):
+  --horizon weekly  : markets resolving within 7 days.
+  --horizon monthly : markets resolving in 7-31 days.
+  --horizon all     : any resolution window. DEFAULT.
 
 Balance management:
   - Fetches live USDC.e balance from Polygon via web3 before each cycle.
@@ -27,9 +38,11 @@ Safety:
   - All exceptions are caught per cycle; the loop never crashes.
 
 Usage:
-    python maker_bot.py --once --verbose        # dry-run, one cycle
-    python maker_bot.py --verbose               # dry-run, continuous
-    python maker_bot.py --live --max-size 3.0   # live trading
+    python maker_bot.py --once --verbose                    # dry-run, one cycle, all sources
+    python maker_bot.py --verbose                           # dry-run, continuous
+    python maker_bot.py --live --max-size 3.0               # live trading
+    python maker_bot.py --source gamma --horizon weekly     # weekly-only scan
+    python maker_bot.py --source clob                       # CLOB-only (legacy)
 
 Requirements:
     pip install py-clob-client python-dotenv web3
@@ -60,6 +73,13 @@ if _dotenv_path.exists():
 
 if str(_CLI) not in sys.path:
     sys.path.insert(0, str(_CLI))
+
+# Local import (after path setup so this works when run as a script)
+from contrib.maker_bot.gamma_markets import (  # noqa: E402
+    fetch_btc_gamma_markets,
+    GammaMarket,
+    DEFAULT_MIN_LIQUIDITY_USD,
+)
 
 # -- Logging -------------------------------------------------------------------
 
@@ -349,7 +369,7 @@ def _classify_momentum(change_pct: Optional[float]) -> tuple[str, float]:
     return ("UP" if change_pct > 0 else "DOWN"), confidence
 
 
-# -- CLOB market fetching ------------------------------------------------------
+# -- Market fetching -----------------------------------------------------------
 
 def fetch_btc_sampling_markets() -> list[ClobMarket]:
     """
@@ -403,7 +423,69 @@ def fetch_btc_sampling_markets() -> list[ClobMarket]:
         ))
 
     result.sort(key=lambda m: m.minimum_order_size)
-    logger.info("Fetched %d active BTC sampling markets", len(result))
+    logger.info("Fetched %d active BTC sampling markets (CLOB)", len(result))
+    return result
+
+
+def _gamma_to_clob_market(g: GammaMarket) -> ClobMarket:
+    """Convert a GammaMarket to a ClobMarket so downstream code is source-agnostic."""
+    return ClobMarket(
+        condition_id=g.condition_id,
+        question=g.question,
+        yes_token_id=g.yes_token_id,
+        no_token_id=g.no_token_id,
+        yes_price=g.yes_price,
+        no_price=g.no_price,
+        accepting_orders=g.accepting_orders,
+        minimum_order_size=max(g.minimum_order_size, MIN_ORDER_SIZE_USD),
+    )
+
+
+def fetch_all_btc_markets(
+    source: str = "all",
+    horizon: str = "all",
+    min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD,
+) -> list[ClobMarket]:
+    """
+    Fetch BTC markets from the requested source(s), deduplicated by condition_id.
+
+    Args:
+        source: 'clob' | 'gamma' | 'all' (default).
+        horizon: 'weekly' | 'monthly' | 'all' (Gamma only).
+        min_liquidity_usd: Minimum liquidity filter for Gamma results.
+
+    Returns:
+        Deduplicated list of ClobMarket, sorted by minimum_order_size ascending.
+    """
+    by_condition: dict[str, ClobMarket] = {}
+
+    if source in ("clob", "all"):
+        for m in fetch_btc_sampling_markets():
+            if m.condition_id:
+                by_condition[m.condition_id] = m
+
+    if source in ("gamma", "all"):
+        try:
+            gamma_markets = fetch_btc_gamma_markets(
+                horizon=horizon,
+                min_liquidity_usd=min_liquidity_usd,
+            )
+        except Exception as exc:
+            logger.error("Gamma fetch failed: %s", exc)
+            gamma_markets = []
+
+        for g in gamma_markets:
+            if not g.condition_id or g.condition_id in by_condition:
+                continue  # CLOB takes priority; it has accurate order book
+            by_condition[g.condition_id] = _gamma_to_clob_market(g)
+
+    result = list(by_condition.values())
+    result.sort(key=lambda m: m.minimum_order_size)
+
+    logger.info(
+        "Total unique BTC markets: %d (source=%s, horizon=%s, min_liq=$%.0f)",
+        len(result), source, horizon, min_liquidity_usd,
+    )
     return result
 
 
@@ -642,6 +724,9 @@ def run_once(
     max_size: float = MAX_ORDER_SIZE_USD,
     min_edge: float = MIN_EDGE_THRESHOLD,
     verbose: bool   = False,
+    source:  str    = "all",
+    horizon: str    = "all",
+    min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD,
 ) -> list[OrderResult]:
     """
     Execute one full cycle: balance check -> fetch -> analyze -> detect -> place.
@@ -656,6 +741,9 @@ def run_once(
         max_size: Maximum order size in USD per trade.
         min_edge: Minimum edge threshold to place an order.
         verbose: If True, log per-market fair value details.
+        source: 'clob' | 'gamma' | 'all'.
+        horizon: 'weekly' | 'monthly' | 'all' (Gamma only).
+        min_liquidity_usd: Minimum liquidity filter for Gamma results.
 
     Returns:
         List of OrderResult for each order attempted this cycle.
@@ -699,8 +787,12 @@ def run_once(
             snapshot.confidence,
         )
 
-    # -- Step 3: Fetch markets -------------------------------------------------
-    markets = fetch_btc_sampling_markets()
+    # -- Step 3: Fetch markets (CLOB + Gamma) ----------------------------------
+    markets = fetch_all_btc_markets(
+        source=source,
+        horizon=horizon,
+        min_liquidity_usd=min_liquidity_usd,
+    )
     if not markets:
         logger.info("No active BTC markets found")
         return results
@@ -753,6 +845,9 @@ def run_loop(
     max_size: float = MAX_ORDER_SIZE_USD,
     min_edge: float = MIN_EDGE_THRESHOLD,
     verbose: bool   = False,
+    source:  str    = "all",
+    horizon: str    = "all",
+    min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD,
 ) -> None:
     """
     Run the maker bot continuously on a fixed interval.
@@ -765,17 +860,26 @@ def run_loop(
         max_size: Maximum order size per trade in USD.
         min_edge: Minimum required edge to place an order.
         verbose: If True, log detailed signal and market information.
+        source: 'clob' | 'gamma' | 'all'.
+        horizon: 'weekly' | 'monthly' | 'all' (Gamma only).
+        min_liquidity_usd: Minimum liquidity filter for Gamma results.
     """
     logger.info(
-        "Maker bot starting | mode=%s | interval=%ds | max_size=$%.2f | min_edge=%.3f",
+        "Maker bot starting | mode=%s | interval=%ds | max_size=$%.2f | "
+        "min_edge=%.3f | source=%s | horizon=%s | min_liq=$%.0f",
         "DRY RUN" if dry_run else "LIVE", interval, max_size, min_edge,
+        source, horizon, min_liquidity_usd,
     )
     cycle = 0
     while True:
         cycle += 1
         logger.info("--- Cycle %d ---", cycle)
         try:
-            run_once(dry_run=dry_run, max_size=max_size, min_edge=min_edge, verbose=verbose)
+            run_once(
+                dry_run=dry_run, max_size=max_size, min_edge=min_edge,
+                verbose=verbose, source=source, horizon=horizon,
+                min_liquidity_usd=min_liquidity_usd,
+            )
         except KeyboardInterrupt:
             logger.info("Stopped by user")
             break
@@ -803,18 +907,30 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
     parser.add_argument("--verbose", action="store_true",
                         help="Print detailed signal and market info")
+    parser.add_argument("--source", choices=["clob", "gamma", "all"], default="all",
+                        help="Market source (default: all = CLOB + Gamma merged)")
+    parser.add_argument("--horizon", choices=["weekly", "monthly", "all"], default="all",
+                        help="Resolution window for Gamma markets (default: all)")
+    parser.add_argument("--min-liquidity", type=float, default=DEFAULT_MIN_LIQUIDITY_USD,
+                        help=f"Min liquidity USD for Gamma markets "
+                             f"(default: ${DEFAULT_MIN_LIQUIDITY_USD:.0f}, "
+                             f"set MIN_LIQUIDITY_USD env to override)")
     args = parser.parse_args()
 
     if args.once:
         results = run_once(
             dry_run=args.dry_run, max_size=args.max_size,
             min_edge=args.min_edge, verbose=args.verbose,
+            source=args.source, horizon=args.horizon,
+            min_liquidity_usd=args.min_liquidity,
         )
         logger.info("Cycle complete: %d order(s) attempted", len(results))
     else:
         run_loop(
             interval=args.interval, dry_run=args.dry_run,
             max_size=args.max_size, min_edge=args.min_edge, verbose=args.verbose,
+            source=args.source, horizon=args.horizon,
+            min_liquidity_usd=args.min_liquidity,
         )
 
 
