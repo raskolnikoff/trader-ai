@@ -71,15 +71,28 @@ if _dotenv_path.exists():
     from dotenv import load_dotenv
     load_dotenv(_dotenv_path, override=True)
 
+# Ensure both trader-cli/ (for `contrib.maker_bot.*`) and the maker_bot
+# directory itself (for sibling imports when run as a script) are on sys.path.
 if str(_CLI) not in sys.path:
     sys.path.insert(0, str(_CLI))
+_THIS_DIR = Path(__file__).parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR))
 
-# Local import (after path setup so this works when run as a script)
-from contrib.maker_bot.gamma_markets import (  # noqa: E402
-    fetch_btc_gamma_markets,
-    GammaMarket,
-    DEFAULT_MIN_LIQUIDITY_USD,
-)
+# Local import: try package-style first (cron / python -m), fall back to
+# sibling-style (direct script invocation).
+try:
+    from contrib.maker_bot.gamma_markets import (  # noqa: E402
+        fetch_btc_gamma_markets,
+        GammaMarket,
+        DEFAULT_MIN_LIQUIDITY_USD,
+    )
+except ImportError:
+    from gamma_markets import (  # noqa: E402
+        fetch_btc_gamma_markets,
+        GammaMarket,
+        DEFAULT_MIN_LIQUIDITY_USD,
+    )
 
 # -- Logging -------------------------------------------------------------------
 
