@@ -4,6 +4,10 @@ Local-first AI trading assistant. Combines TradingView chart data, Binance price
 
 No cloud APIs. No permission dialogs. Runs entirely on your machine.
 
+<p align="center">
+  <img src="docs/architecture.svg" alt="trader-ai architecture" width="680"/>
+</p>
+
 ---
 
 ## What it does
@@ -87,6 +91,78 @@ Bot filter removes three noise patterns automatically:
 
 ---
 
+## Maker Bot
+
+A Polymarket maker-only order bot. Scans BTC price markets, detects mispricing against a Binance-derived fair value, and posts limit orders on the underpriced side when the edge exceeds a configurable threshold (default 4%).
+
+**Safety-first design:**
+- `--dry-run` is the default. Pass `--live` explicitly for real orders.
+- On-chain balance check (USDC.e on Polygon) runs every cycle. If it fails, the cycle halts — no fail-open paths.
+- Per-cycle order cap is derived from spendable balance, never a fixed number.
+- Maker-only (zero fees, small rebate). The bot never places taker orders.
+- `MIN_EDGE_THRESHOLD = 0.04` — most cycles do nothing, by design.
+
+```bash
+# Dry run with CLOB + Gamma markets merged (default)
+python trader-cli/contrib/maker_bot/maker_bot.py --once --verbose
+
+# Weekly markets only, high-liquidity filter
+python trader-cli/contrib/maker_bot/maker_bot.py --once --verbose \
+  --source gamma --horizon weekly --min-liquidity 50000
+
+# Live (requires .env with POLY_* + PRIVATE_KEY)
+python trader-cli/contrib/maker_bot/maker_bot.py --live --max-size 3.0
+```
+
+### Running on a schedule
+
+```bash
+# Install a cron entry that runs the bot every 2 minutes
+./trader-cli/contrib/maker_bot/cron_setup.sh install
+
+# Status
+./trader-cli/contrib/maker_bot/cron_setup.sh status
+
+# Emergency stop (kills cron + running processes + clears lock)
+./scripts/kill_bot.sh
+```
+
+Cron features: auto-detects anaconda / miniconda / homebrew paths, loads `.env`, `flock` prevents overlapping cycles, daily logrotate at 4am keeps 14 days of gzipped logs.
+
+macOS users: grant Full Disk Access to `/usr/sbin/cron` in System Settings → Privacy & Security, or cron fails silently.
+
+---
+
+## Dashboard
+
+A standalone HTML dashboard (dark, vanilla JS, no framework) that polls the webhook server's `/feed` endpoint for live state.
+
+```bash
+# 1. Start the webhook server
+python trader-cli/contrib/maker_bot/tv_overlay_webhook.py
+
+# 2. Serve the dashboard statically (any static server)
+cd dashboard && python -m http.server 8080
+
+# 3. Open http://localhost:8080 — pass ?api=http://your-server:8765 if needed
+```
+
+Shows: BTC price + 5m delta (from Binance), wallet balance, positions, markets scan (fair vs market price + edge), recent alerts, and an optional TradingView chart snapshot when TV Desktop is running in debug mode.
+
+![Dashboard](docs/architecture.svg)
+
+---
+
+## TradingView alerts (optional, Pro+ plan)
+
+Free-plan TradingView users can skip this — the maker bot is fully self-contained.
+
+If you have a Pro+ plan, you can wire TV alerts into the webhook server via ngrok. See [`docs/webhook_setup.md`](docs/webhook_setup.md) for the full setup (secret generation, ngrok tunnel, Pine Script template, verification curl commands).
+
+The `pine/polymarket_overlay.pine` reference script includes a ready-to-use momentum trigger and an `alertcondition()` that pairs with the webhook body template in the setup guide.
+
+---
+
 ## Polymarket Market Finder
 
 Find Polymarket markets relevant to a TradingView symbol.
@@ -136,6 +212,10 @@ claude mcp add --transport stdio tradingview -- \
 | `db.py` | SQLite storage (messages, analysis_results, session) |
 | `monitor.py` | Copy trading wallet monitor with bot filter |
 | `polymarket_markets.py` | TV symbol → Polymarket market lookup |
+| `maker_bot.py` | Polymarket maker-order bot (balance-aware, fail-safe) |
+| `gamma_markets.py` | Gamma API client for short-term markets |
+| `tv_overlay_webhook.py` | Webhook server (auth, rate limit, TV chart snapshot) |
+| `dashboard/` | Standalone HTML dashboard, polls `/feed` |
 
 ---
 
@@ -174,6 +254,21 @@ data/
 
 ```
 trader-ai/
+├── dashboard/                     # Live dashboard (HTML + CSS + JS, no framework)
+│   ├── index.html
+│   ├── style.css
+│   └── app.js
+├── docs/
+│   ├── architecture.svg           # Light/dark-aware architecture diagram
+│   ├── webhook_setup.md           # ngrok + TV alert setup (Pro+ plan)
+│   └── linkedin_post.md           # Announcement post templates
+├── pine/
+│   └── polymarket_overlay.pine    # Reference Pine Script (Pro+ plan, optional)
+├── scripts/
+│   ├── trader.sh
+│   ├── dev.sh
+│   ├── kill_bot.sh                # Emergency stop: removes cron, kills processes
+│   └── start_ngrok.sh             # ngrok tunnel helper
 ├── trader-cli/
 │   ├── main.py                    # Legacy CLI entry (analyze, history, search)
 │   ├── tv_client.py               # TradingView CDP client
@@ -182,8 +277,13 @@ trader-ai/
 │   ├── rag.py                     # Symbol-aware RAG retrieval
 │   ├── db.py                      # SQLite storage layer
 │   └── contrib/
+│       ├── maker_bot/             # Polymarket maker bot
+│       │   ├── maker_bot.py
+│       │   ├── gamma_markets.py
+│       │   ├── tv_overlay_webhook.py
+│       │   └── cron_setup.sh
 │       ├── tv_polymarket/         # Unified signal integration
-│       │   ├── analyze_unified.py # Main entry point
+│       │   ├── analyze_unified.py
 │       │   ├── signal_integrator.py
 │       │   ├── unified_prompt.py
 │       │   └── polymarket_markets.py
@@ -195,9 +295,6 @@ trader-ai/
 │           ├── ws_detector.py
 │           └── backtest.py
 ├── tradingview-mcp/               # TradingView MCP server (do not modify)
-├── scripts/
-│   ├── trader.sh
-│   └── dev.sh
 └── data/
     ├── trader.db
     ├── watched_wallets.json

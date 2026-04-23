@@ -1,0 +1,412 @@
+/* ==========================================================================
+   trader-ai live — dashboard stylesheet
+   ==========================================================================
+   Aesthetic: modern SaaS, dark, refined.
+   - Pure black canvas (#000) with cards floated 1 layer (#0a0a0a).
+   - Geist (Vercel) for UI, Geist Mono for numbers/code.
+   - Accent: electric lime (#d4ff00) for live/alive moments.
+   - tabular-nums everywhere numbers appear; digits never jitter.
+   - Subtle SVG grain overlay for texture without distraction.
+   ========================================================================== */
+
+/* -- Fonts: Geist + Geist Mono served via jsDelivr CDN.
+   If offline, falls back to system-ui stack. */
+@import url("https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-sans/geist-sans.css");
+@import url("https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-mono/geist-mono.css");
+
+:root {
+  /* Canvas */
+  --bg:         #000;
+  --bg-card:    #0a0a0a;
+  --bg-elev:   #121212;
+
+  /* Borders */
+  --border:       rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+
+  /* Text */
+  --text:        #ededed;
+  --text-muted:  #888;
+  --text-flat:   #555;
+
+  /* Accents */
+  --accent:        #d4ff00;   /* electric lime — profit / live / success */
+  --accent-soft:   rgba(212, 255, 0, 0.14);
+  --accent-glow:   rgba(212, 255, 0, 0.4);
+  --danger:        #ff4d4f;
+  --danger-soft:   rgba(255, 77, 79, 0.14);
+
+  /* Motion */
+  --ease:  cubic-bezier(0.2, 0, 0, 1);
+
+  /* Rhythm */
+  --gap:   24px;
+  --radius: 14px;
+}
+
+/* -- Reset ---------------------------------------------------------------- */
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-feature-settings: "ss01", "cv11";
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  min-height: 100vh;
+  line-height: 1.5;
+}
+
+a { color: inherit; text-decoration: none; }
+a:hover { color: var(--accent); }
+
+.mono { font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tnum { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+.muted { color: var(--text-muted); }
+
+/* -- Grain overlay (3% SVG noise, fixed to viewport) ---------------------- */
+
+.grain {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1000;
+  opacity: 0.035;
+  mix-blend-mode: screen;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 1 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+}
+
+/* -- Header --------------------------------------------------------------- */
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 32px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  z-index: 100;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.brand-mark {
+  color: var(--accent);
+  filter: drop-shadow(0 0 8px var(--accent-glow));
+}
+.brand-name { font-weight: 600; }
+.brand-divider { color: var(--text-flat); }
+.brand-sub { color: var(--text-muted); font-size: 14px; }
+
+.header-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+.header-divider { color: var(--text-flat); }
+
+/* -- Status indicator (live pulse) ---------------------------------------- */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-flat);
+  box-shadow: 0 0 0 0 transparent;
+}
+.status-dot[data-state="live"] {
+  background: var(--accent);
+  animation: pulse 2s var(--ease) infinite;
+}
+.status-dot[data-state="connecting"] {
+  background: #888;
+  animation: flicker 1.2s var(--ease) infinite;
+}
+.status-dot[data-state="error"] {
+  background: var(--danger);
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); }
+  50%      { box-shadow: 0 0 0 8px transparent; }
+}
+@keyframes flicker {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.3; }
+}
+
+/* -- Grid ----------------------------------------------------------------- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--gap);
+  padding: var(--gap) 32px 64px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+.card-price    { grid-column: span 2; }
+.card-wallet   { grid-column: span 2; }
+.card-wide     { grid-column: span 4; }
+.card-activity { grid-column: span 2; }
+.card-tv       { grid-column: span 2; }
+
+@media (max-width: 960px) {
+  .grid { grid-template-columns: 1fr; padding: 16px; gap: 16px; }
+  .card-price, .card-wallet, .card-wide, .card-activity, .card-tv {
+    grid-column: span 1;
+  }
+  .site-header { padding: 16px; }
+}
+
+/* -- Card ----------------------------------------------------------------- */
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+  position: relative;
+  transition: border-color 200ms var(--ease), transform 200ms var(--ease);
+}
+.card:hover {
+  border-color: var(--border-strong);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+.card-label {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.card-source {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+/* -- Metrics -------------------------------------------------------------- */
+
+.metric-xl {
+  font-size: clamp(36px, 4.5vw, 56px);
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.05;
+  transition: color 500ms var(--ease);
+}
+.metric-xl.flash-up   { color: var(--accent); }
+.metric-xl.flash-down { color: var(--danger); }
+
+.metric-lg {
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.metric-delta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 13px;
+}
+.delta-pill {
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-weight: 500;
+  font-size: 13px;
+}
+.delta-pill[data-sign="up"]   { color: var(--accent);  background: var(--accent-soft); }
+.delta-pill[data-sign="down"] { color: var(--danger);  background: var(--danger-soft); }
+.delta-pill[data-sign="flat"] { color: var(--text-muted); background: rgba(255,255,255,0.04); }
+
+/* -- Wallet grid ---------------------------------------------------------- */
+
+.wallet-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+.wallet-grid .muted {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+/* -- Markets table -------------------------------------------------------- */
+
+.table-wrap {
+  overflow-x: auto;
+  max-height: 360px;
+  border-radius: 8px;
+}
+.markets-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.markets-table th,
+.markets-table td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.markets-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-card);
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  z-index: 2;
+}
+.markets-table td.num,
+.markets-table th.num {
+  text-align: right;
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.markets-table tbody tr:last-child td { border-bottom: none; }
+.markets-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+.markets-table .row-empty td {
+  color: var(--text-muted);
+  font-style: italic;
+  text-align: center;
+  padding: 24px;
+}
+.edge-cell { font-weight: 500; }
+.edge-cell[data-sign="up"]   { color: var(--accent); }
+.edge-cell[data-sign="down"] { color: var(--danger); }
+
+/* -- Activity feed -------------------------------------------------------- */
+
+.activity {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.activity li {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.activity li:last-child { border-bottom: none; }
+.activity .time {
+  color: var(--text-muted);
+  font-family: "Geist Mono", monospace;
+  font-size: 12px;
+}
+.activity .event .action {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.06);
+  font-size: 11px;
+  margin-right: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.activity .event .action[data-kind="buy"]  { color: var(--accent); background: var(--accent-soft); }
+.activity .event .action[data-kind="sell"] { color: var(--danger); background: var(--danger-soft); }
+.activity-empty {
+  padding: 24px;
+  text-align: center;
+  font-style: italic;
+}
+
+/* -- TV chart card -------------------------------------------------------- */
+
+.tv-body {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 160px;
+}
+.tv-symbol {
+  font-size: 18px;
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+.tv-meta {
+  display: flex;
+  gap: 16px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.tv-meta .mono { color: var(--text); }
+
+/* -- Footer --------------------------------------------------------------- */
+
+.site-footer {
+  border-top: 1px solid var(--border);
+  padding: 20px 32px;
+  text-align: center;
+  font-size: 12px;
+}
+
+/* -- Flash highlight (number changes) ------------------------------------- */
+
+@keyframes flash-up {
+  0%   { background: var(--accent-soft); }
+  100% { background: transparent; }
+}
+@keyframes flash-down {
+  0%   { background: var(--danger-soft); }
+  100% { background: transparent; }
+}
+.flash-cell-up {
+  animation: flash-up 600ms var(--ease);
+}
+.flash-cell-down {
+  animation: flash-down 600ms var(--ease);
+}
+
+/* -- Respect users who prefer less motion --------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
