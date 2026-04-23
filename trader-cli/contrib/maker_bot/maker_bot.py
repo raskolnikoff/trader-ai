@@ -6,11 +6,31 @@ Strategy:
   1. Fetch current BTC price and momentum from Binance (5m candles).
   2. Fetch active BTC markets from Polymarket CLOB sampling endpoint
      AND/OR the public Gamma API (for weekly/monthly short-term markets).
-  3. For each market, compute a fair-value probability using Binance price
-     relative to the market's resolution threshold (strike price).
+  3. For each market, compute a fair-value probability using a GBM-based
+     touch-probability model when the market's end_date is known, or a
+     sigmoid fallback otherwise.
   4. Compare fair value against current Polymarket odds to detect mispricing.
   5. Place a limit (maker) order on the underpriced side if edge >= threshold.
   6. Repeat on a configurable interval.
+
+Fair-value model (v2 — PR #21):
+  When end_date is available, we price the market as a "barrier touch"
+  probability under geometric Brownian motion (GBM) with constant volatility.
+  For a "reach $K by date T" market:
+
+      P(max_{t<=T} S_t >= K) = Phi(d1) + (K/S_0)^(2r/sigma^2 - 1) * Phi(d2)
+
+  Parameters:
+    sigma = GBM_VOL_ANNUAL (default 0.60, representative BTC realised vol)
+    r     = 0                (short horizon, negligible drift)
+    T     = (end_date - now) in years, clamped to [1/365, 3.0]
+  Dip markets (`S_0 > K` and "dip/below/drop/fall" in question) are priced as
+  P(min_{t<=T} S_t <= K), which by symmetry equals the reach probability with
+  S_0 and K swapped.
+
+  When end_date is missing, the model falls back to the previous sigmoid
+  heuristic — preserving backwards compatibility with sources that lack a
+  resolution date.
 
 Market sourcing:
   --source clob    : CLOB sampling endpoint only (original behavior).
@@ -28,11 +48,17 @@ Balance management:
   - Skips cycle entirely if balance < MIN_ORDER_SIZE_USD.
   - Fail-safe: on any balance check error, returns 0.0 (halts cycle).
 
+Sanity filters:
+  - Markets with yes_price outside [MIN_MARKET_PROBABILITY,
+    MAX_MARKET_PROBABILITY] are skipped (tail markets are unreliable inputs).
+  - Opportunities with edge > MAX_EDGE_SANITY_CAP are logged and skipped
+    (model is probably wrong, not the market).
+
 Maker orders pay zero fees and earn a rebate on Polymarket CLOB.
 This bot NEVER places taker orders.
 
 Safety:
-  - --dry-run is the DEFAULT. Pass --live to place real orders.
+  - --live is required to place real orders (default: dry-run).
   - Max position size is capped by MAX_ORDER_SIZE_USD.
   - Minimum edge required is MIN_EDGE_THRESHOLD.
   - All exceptions are caught per cycle; the loop never crashes.
@@ -57,7 +83,8 @@ import sys
 import time
 import urllib.request
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -127,6 +154,37 @@ HTTP_TIMEOUT_SEC: int      = 8
 # Reserve fraction of balance -- never spend 100% to leave room for gas
 BALANCE_RESERVE_RATIO: float = 0.90  # use at most 90% of available balance
 
+# -- Fair-value model parameters (PR #21) --------------------------------------
+
+# Annualised BTC volatility used in the GBM model. 0.60 is a representative
+# realised-vol value for BTC over the last 1-2 years. Overridable via env.
+GBM_VOL_ANNUAL: float = float(os.environ.get("GBM_VOL_ANNUAL", "0.60"))
+
+# Horizon cap in years. Any market resolving more than this far out is clamped
+# so the model does not output absurdly high probabilities on long horizons.
+MAX_HORIZON_YEARS: float = 3.0
+
+# Minimum horizon (1 day) to avoid div-by-zero for near-expiry markets.
+MIN_HORIZON_YEARS: float = 1.0 / 365.0
+
+# Risk-free rate in the GBM drift term. Zero is a reasonable simplification
+# for the horizons we price (weeks to months) and lets probability be driven
+# purely by spot-vs-strike distance and volatility.
+GBM_RISK_FREE_RATE: float = 0.0
+
+# -- Sanity-filter parameters (PR #21) -----------------------------------------
+
+# Tail markets (very low or very high yes_price) are dominated by factors the
+# model does not capture (time decay, resolution ambiguity, liquidation). Skip
+# them outright rather than trust a computed edge against them.
+MIN_MARKET_PROBABILITY: float = 0.05
+MAX_MARKET_PROBABILITY: float = 0.95
+
+# If the computed edge is larger than this, log a warning and skip the order.
+# A 25%+ mispricing on a liquid Polymarket market is almost always a model
+# bug on our side, not a real arbitrage.
+MAX_EDGE_SANITY_CAP: float = 0.20
+
 # Keywords indicating this is a BTC price prediction market
 _PRICE_KEYWORDS: list[str] = [
     "reach", "hit", "dip to", "above", "below", "between", "exceed"
@@ -135,7 +193,7 @@ _PRICE_KEYWORDS: list[str] = [
 # Keywords indicating the market resolves YES if price goes DOWN
 _DIP_KEYWORDS: list[str] = ["dip", "below", "drop", "fall"]
 
-# Sigmoid scaling factor for distance->probability conversion
+# Sigmoid scaling factor for the legacy distance->probability fallback
 _SIGMOID_SCALE: float = 3.0
 
 
@@ -153,7 +211,12 @@ class BinanceSnapshot:
 
 @dataclass
 class ClobMarket:
-    """A Polymarket market fetched from the CLOB API with real-time token prices."""
+    """
+    A Polymarket market fetched from the CLOB API with real-time token prices.
+
+    `end_date` is optional and only populated when the source (e.g. Gamma) or
+    CLOB metadata provides it. Used by the GBM fair-value model.
+    """
     condition_id: str
     question: str
     yes_token_id: str
@@ -162,6 +225,7 @@ class ClobMarket:
     no_price: float
     accepting_orders: bool
     minimum_order_size: float
+    end_date: Optional[datetime] = None
 
 
 @dataclass
@@ -191,15 +255,7 @@ class OrderResult:
 # -- HTTP helper ---------------------------------------------------------------
 
 def _fetch_json(url: str) -> Optional[dict | list]:
-    """
-    Fetch JSON from a URL synchronously. Returns None on any error.
-
-    Args:
-        url: Full URL to fetch.
-
-    Returns:
-        Parsed JSON, or None on failure.
-    """
+    """Fetch JSON from a URL synchronously. Returns None on any error."""
     req = urllib.request.Request(
         url,
         headers={
@@ -226,12 +282,6 @@ def fetch_usdc_e_balance(wallet_address: str) -> float:
 
     Fail-safe behavior:
       On ANY error (missing web3, RPC failure, bad address, etc.), returns 0.0.
-      The downstream logic in run_once() skips the cycle when balance is below
-      MIN_ORDER_SIZE_USD, so returning 0.0 halts trading safely rather than
-      allowing uncapped orders via float('inf').
-
-    Args:
-        wallet_address: Ethereum-compatible wallet address (0x...).
 
     Returns:
         Balance in USD (float). Returns 0.0 on any error (fail-safe).
@@ -242,7 +292,7 @@ def fetch_usdc_e_balance(wallet_address: str) -> float:
         logger.error(
             "web3 not installed -- HALTING cycle. Run: pip install web3"
         )
-        return 0.0  # fail-safe: treat as insufficient balance
+        return 0.0
 
     try:
         w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
@@ -261,29 +311,20 @@ def fetch_usdc_e_balance(wallet_address: str) -> float:
         raw = contract.functions.balanceOf(
             Web3.to_checksum_address(wallet_address)
         ).call()
-        balance_usd = raw / 1e6  # USDC.e has 6 decimals
+        balance_usd = raw / 1e6
         logger.info("USDC.e balance: $%.4f", balance_usd)
         return balance_usd
     except Exception as exc:
         logger.error(
             "Balance check failed: %s -- HALTING cycle for safety", exc
         )
-        return 0.0  # fail-safe: treat as insufficient balance
+        return 0.0
 
 
 # -- CLOB client ---------------------------------------------------------------
 
 def _build_clob_client():
-    """
-    Build an authenticated ClobClient from environment credentials.
-
-    Returns:
-        Authenticated ClobClient instance.
-
-    Raises:
-        EnvironmentError: If any required env var is missing.
-        ImportError: If py-clob-client is not installed.
-    """
+    """Build an authenticated ClobClient from environment credentials."""
     try:
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import ApiCreds
@@ -316,12 +357,7 @@ def _build_clob_client():
 # -- Binance -------------------------------------------------------------------
 
 def fetch_binance_snapshot() -> Optional[BinanceSnapshot]:
-    """
-    Fetch current BTC price and 5m/30m momentum from Binance REST API.
-
-    Returns:
-        BinanceSnapshot, or None if Binance is unreachable.
-    """
+    """Fetch current BTC price and 5m/30m momentum from Binance REST API."""
     price_data = _fetch_json(BINANCE_PRICE_URL)
     kline_data = _fetch_json(BINANCE_KLINE_URL)
 
@@ -359,15 +395,6 @@ def fetch_binance_snapshot() -> Optional[BinanceSnapshot]:
 
 
 def _classify_momentum(change_pct: Optional[float]) -> tuple[str, float]:
-    """
-    Classify price momentum direction and confidence.
-
-    Args:
-        change_pct: % price change. None treated as flat.
-
-    Returns:
-        (direction, confidence) where direction is UP/DOWN/FLAT.
-    """
     if change_pct is None or abs(change_pct) < 0.05:
         return "FLAT", 0.0
 
@@ -383,6 +410,27 @@ def _classify_momentum(change_pct: Optional[float]) -> tuple[str, float]:
 
 
 # -- Market fetching -----------------------------------------------------------
+
+def _parse_clob_end_date(raw_market: dict) -> Optional[datetime]:
+    """
+    Extract an end_date from a CLOB sampling market payload.
+
+    The CLOB response sometimes includes `end_date_iso` (ISO-8601 UTC) and
+    sometimes `end_date`. Returns None if neither is usable.
+    """
+    for key in ("end_date_iso", "endDateIso", "end_date"):
+        value = raw_market.get(key)
+        if not value:
+            continue
+        try:
+            if isinstance(value, str):
+                if value.endswith("Z"):
+                    value = value[:-1] + "+00:00"
+                return datetime.fromisoformat(value)
+        except (ValueError, TypeError):
+            continue
+    return None
+
 
 def fetch_btc_sampling_markets() -> list[ClobMarket]:
     """
@@ -433,6 +481,7 @@ def fetch_btc_sampling_markets() -> list[ClobMarket]:
             no_price=no_price,
             accepting_orders=True,
             minimum_order_size=float(m.get("minimum_order_size", MIN_ORDER_SIZE_USD)),
+            end_date=_parse_clob_end_date(m),
         ))
 
     result.sort(key=lambda m: m.minimum_order_size)
@@ -441,7 +490,7 @@ def fetch_btc_sampling_markets() -> list[ClobMarket]:
 
 
 def _gamma_to_clob_market(g: GammaMarket) -> ClobMarket:
-    """Convert a GammaMarket to a ClobMarket so downstream code is source-agnostic."""
+    """Convert a GammaMarket to a ClobMarket (source-agnostic downstream)."""
     return ClobMarket(
         condition_id=g.condition_id,
         question=g.question,
@@ -451,6 +500,7 @@ def _gamma_to_clob_market(g: GammaMarket) -> ClobMarket:
         no_price=g.no_price,
         accepting_orders=g.accepting_orders,
         minimum_order_size=max(g.minimum_order_size, MIN_ORDER_SIZE_USD),
+        end_date=g.end_date,
     )
 
 
@@ -459,17 +509,7 @@ def fetch_all_btc_markets(
     horizon: str = "all",
     min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD,
 ) -> list[ClobMarket]:
-    """
-    Fetch BTC markets from the requested source(s), deduplicated by condition_id.
-
-    Args:
-        source: 'clob' | 'gamma' | 'all' (default).
-        horizon: 'weekly' | 'monthly' | 'all' (Gamma only).
-        min_liquidity_usd: Minimum liquidity filter for Gamma results.
-
-    Returns:
-        Deduplicated list of ClobMarket, sorted by minimum_order_size ascending.
-    """
+    """Fetch BTC markets, deduplicated by condition_id."""
     by_condition: dict[str, ClobMarket] = {}
 
     if source in ("clob", "all"):
@@ -489,7 +529,7 @@ def fetch_all_btc_markets(
 
         for g in gamma_markets:
             if not g.condition_id or g.condition_id in by_condition:
-                continue  # CLOB takes priority; it has accurate order book
+                continue
             by_condition[g.condition_id] = _gamma_to_clob_market(g)
 
     result = list(by_condition.values())
@@ -515,12 +555,6 @@ def _extract_strike_price(question: str) -> Optional[float]:
     Extract the dollar strike price from a market question string.
 
     Supports: $100,000  $150k  $1.5m
-
-    Args:
-        question: Market question string.
-
-    Returns:
-        Strike price as float (USD), or None if not found.
     """
     patterns: list[tuple[str, float]] = [
         (r"\$([0-9]+(?:\.[0-9]+)?)\s*m\b", 1_000_000),
@@ -537,7 +571,84 @@ def _extract_strike_price(question: str) -> Optional[float]:
     return None
 
 
-# -- Fair value model ----------------------------------------------------------
+# -- Fair-value model: GBM barrier-touch probability ---------------------------
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via math.erf (no scipy dependency)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _touch_probability_up(
+    s0: float,
+    k: float,
+    t_years: float,
+    sigma: float = GBM_VOL_ANNUAL,
+    r: float = GBM_RISK_FREE_RATE,
+) -> float:
+    """
+    Probability that a GBM process starting at S_0 touches the upper barrier K
+    at any time within [0, T]. Reflection-principle closed form:
+
+        P = Phi(d1) + (K/S_0)^(2r/sigma^2 - 1) * Phi(d2)
+
+    where
+        d1 = [ln(S_0/K) + (r - sigma^2/2)T] / (sigma * sqrt(T))
+        d2 = d1 - 2 ln(S_0/K) / (sigma * sqrt(T))
+
+    Only meaningful when K > S_0. If K <= S_0 the barrier has already been
+    touched, so we return 1.0.
+    """
+    if s0 <= 0 or k <= 0 or t_years <= 0 or sigma <= 0:
+        return 0.5
+    if k <= s0:
+        return 1.0
+
+    sqrt_t = math.sqrt(t_years)
+    vol_adj = sigma * sqrt_t
+    log_ratio = math.log(s0 / k)  # negative since k > s0
+
+    d1 = (log_ratio + (r - 0.5 * sigma * sigma) * t_years) / vol_adj
+    d2 = d1 - (2.0 * log_ratio) / vol_adj
+
+    # Exponent (2r/sigma^2 - 1). With r=0, this is -1, so the second term
+    # collapses to (s0/k) * Phi(d2).
+    exponent = (2.0 * r / (sigma * sigma)) - 1.0
+    ratio_term = (k / s0) ** exponent
+
+    return _norm_cdf(d1) + ratio_term * _norm_cdf(d2)
+
+
+def _touch_probability_down(
+    s0: float,
+    k: float,
+    t_years: float,
+    sigma: float = GBM_VOL_ANNUAL,
+    r: float = GBM_RISK_FREE_RATE,
+) -> float:
+    """
+    Probability that a GBM process starting at S_0 touches the lower barrier K
+    within [0, T]. By reflection symmetry this equals the upper-touch
+    probability with S_0 and K swapped.
+    """
+    if s0 <= 0 or k <= 0 or t_years <= 0 or sigma <= 0:
+        return 0.5
+    if k >= s0:
+        return 1.0
+    return _touch_probability_up(k, s0, t_years, sigma=sigma, r=r)
+
+
+def _time_to_resolution_years(end_date: Optional[datetime]) -> Optional[float]:
+    """Return years from now until end_date, clamped to [MIN, MAX]. None if unknown."""
+    if end_date is None:
+        return None
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=timezone.utc)
+    delta = end_date - datetime.now(timezone.utc)
+    years = delta.total_seconds() / (365.25 * 24 * 3600)
+    if years <= 0:
+        return None  # market already expired, caller should skip
+    return max(MIN_HORIZON_YEARS, min(MAX_HORIZON_YEARS, years))
+
 
 def compute_fair_value_for_market(
     market: ClobMarket,
@@ -546,42 +657,48 @@ def compute_fair_value_for_market(
     """
     Estimate fair YES/NO probability for a BTC price market.
 
-    Uses sigmoid function on normalized distance from strike price,
-    with a small momentum adjustment.
-
-    Args:
-        market: ClobMarket to evaluate.
-        snapshot: Current Binance price snapshot.
+    Uses the GBM barrier-touch model when market.end_date is known, otherwise
+    falls back to the legacy sigmoid heuristic with a small momentum tilt.
 
     Returns:
-        (yes_fair, no_fair) both in [0.05, 0.95], summing to 1.0.
+        (yes_fair, no_fair) both clamped to [0.05, 0.95], summing to 1.0.
     """
     strike = _extract_strike_price(market.question)
     if strike is None or strike <= 0:
         return _momentum_fair_value(snapshot)
 
-    current     = snapshot.price
-    is_dip      = any(kw in market.question.lower() for kw in _DIP_KEYWORDS)
-    distance    = (current - strike) / strike
-    signed_dist = distance if not is_dip else -distance
-    yes_fair_raw = 1.0 / (1.0 + math.exp(-_SIGMOID_SCALE * signed_dist))
+    is_dip = any(kw in market.question.lower() for kw in _DIP_KEYWORDS)
+    t_years = _time_to_resolution_years(market.end_date)
 
-    momentum_adj = snapshot.confidence * 0.05
-    if snapshot.direction == "UP" and not is_dip:
-        yes_fair_raw += momentum_adj
-    elif snapshot.direction == "DOWN" and is_dip:
-        yes_fair_raw += momentum_adj
-    elif snapshot.direction == "UP" and is_dip:
-        yes_fair_raw -= momentum_adj
-    elif snapshot.direction == "DOWN" and not is_dip:
-        yes_fair_raw -= momentum_adj
+    if t_years is not None:
+        # GBM touch-probability branch
+        if is_dip:
+            yes_fair_raw = _touch_probability_down(snapshot.price, strike, t_years)
+        else:
+            yes_fair_raw = _touch_probability_up(snapshot.price, strike, t_years)
+    else:
+        # Legacy sigmoid fallback
+        current = snapshot.price
+        distance = (current - strike) / strike
+        signed_dist = distance if not is_dip else -distance
+        yes_fair_raw = 1.0 / (1.0 + math.exp(-_SIGMOID_SCALE * signed_dist))
+
+        momentum_adj = snapshot.confidence * 0.05
+        if snapshot.direction == "UP" and not is_dip:
+            yes_fair_raw += momentum_adj
+        elif snapshot.direction == "DOWN" and is_dip:
+            yes_fair_raw += momentum_adj
+        elif snapshot.direction == "UP" and is_dip:
+            yes_fair_raw -= momentum_adj
+        elif snapshot.direction == "DOWN" and not is_dip:
+            yes_fair_raw -= momentum_adj
 
     yes_fair = max(0.05, min(0.95, yes_fair_raw))
     return yes_fair, round(1.0 - yes_fair, 4)
 
 
 def _momentum_fair_value(snapshot: BinanceSnapshot) -> tuple[float, float]:
-    """Fallback fair value based purely on Binance momentum."""
+    """Fallback fair value based purely on Binance momentum (no strike info)."""
     adj = snapshot.confidence * 0.10
     if snapshot.direction == "UP":
         yes_fair = 0.50 + adj
@@ -604,15 +721,23 @@ def detect_opportunity(
     """
     Detect a maker opportunity in a single market.
 
-    Args:
-        market: The ClobMarket to evaluate.
-        snapshot: Current Binance snapshot.
-        min_edge: Minimum probability difference required to trade.
-        max_size: Maximum order size in USD.
-
-    Returns:
-        MarketOpportunity if edge found, None otherwise.
+    Returns None if:
+      - yes_price is outside [MIN_MARKET_PROBABILITY, MAX_MARKET_PROBABILITY]
+        (tail markets are filtered as unreliable)
+      - edge is below min_edge on both sides
+      - edge exceeds MAX_EDGE_SANITY_CAP (logged WARN; probable model bug)
     """
+    # Tail-market filter
+    if (
+        market.yes_price < MIN_MARKET_PROBABILITY
+        or market.yes_price > MAX_MARKET_PROBABILITY
+    ):
+        logger.debug(
+            "Skipping tail market (yes=%.3f): %s",
+            market.yes_price, market.question[:60],
+        )
+        return None
+
     yes_fair, no_fair = compute_fair_value_for_market(market, snapshot)
 
     yes_edge = yes_fair - market.yes_price
@@ -631,6 +756,16 @@ def detect_opportunity(
         market_price = market.no_price
         edge         = no_edge
     else:
+        return None
+
+    # Sanity cap: reject absurd edges (usually a model bug, not an arb)
+    if edge > MAX_EDGE_SANITY_CAP:
+        logger.warning(
+            "Edge %.3f exceeds sanity cap %.3f on '%s' (fair=%.3f market=%.3f); "
+            "skipping as probable model error.",
+            edge, MAX_EDGE_SANITY_CAP,
+            market.question[:60], fair_value, market_price,
+        )
         return None
 
     order_price = round(max(0.01, min(0.99, fair_value - MAKER_PRICE_OFFSET)), 2)
@@ -655,16 +790,7 @@ def place_maker_order(
     opportunity: MarketOpportunity,
     dry_run: bool = True,
 ) -> OrderResult:
-    """
-    Place a maker limit order on the Polymarket CLOB.
-
-    Args:
-        opportunity: The detected market opportunity.
-        dry_run: If True, log the order but do not submit it.
-
-    Returns:
-        OrderResult with success status and order ID if placed.
-    """
+    """Place a maker limit order on the Polymarket CLOB."""
     if dry_run:
         logger.info(
             "[DRY RUN] Would place MAKER order:\n"
@@ -702,7 +828,7 @@ def place_maker_order(
             token_id=opportunity.target_token_id,
             price=opportunity.order_price,
             size=opportunity.order_size,
-            side="BUY",  # side is plain string in current py-clob-client
+            side="BUY",
         )
         response = client.create_and_post_order(order_args)
         order_id = (
@@ -741,29 +867,10 @@ def run_once(
     horizon: str    = "all",
     min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD,
 ) -> list[OrderResult]:
-    """
-    Execute one full cycle: balance check -> fetch -> analyze -> detect -> place.
-
-    Balance management:
-      - Reads live USDC.e balance from Polygon.
-      - Caps number of orders so total spend <= balance * BALANCE_RESERVE_RATIO.
-      - Skips cycle if balance < MIN_ORDER_SIZE_USD.
-
-    Args:
-        dry_run: If True, do not place real orders.
-        max_size: Maximum order size in USD per trade.
-        min_edge: Minimum edge threshold to place an order.
-        verbose: If True, log per-market fair value details.
-        source: 'clob' | 'gamma' | 'all'.
-        horizon: 'weekly' | 'monthly' | 'all' (Gamma only).
-        min_liquidity_usd: Minimum liquidity filter for Gamma results.
-
-    Returns:
-        List of OrderResult for each order attempted this cycle.
-    """
+    """Execute one full cycle."""
     results: list[OrderResult] = []
 
-    # -- Step 1: Balance check -------------------------------------------------
+    # Step 1: Balance check
     wallet = os.environ.get("POLY_WALLET_ADDRESS", "")
     if wallet and not dry_run:
         balance   = fetch_usdc_e_balance(wallet)
@@ -780,11 +887,11 @@ def run_once(
             balance, spendable, max_orders,
         )
     else:
-        max_orders = 999  # dry-run: no limit
+        max_orders = 999
         if dry_run:
             logger.info("DRY RUN: skipping balance check")
 
-    # -- Step 2: Binance snapshot ----------------------------------------------
+    # Step 2: Binance snapshot
     snapshot = fetch_binance_snapshot()
     if snapshot is None:
         logger.warning("Skipping cycle: Binance unavailable")
@@ -800,7 +907,7 @@ def run_once(
             snapshot.confidence,
         )
 
-    # -- Step 3: Fetch markets (CLOB + Gamma) ----------------------------------
+    # Step 3: Fetch markets
     markets = fetch_all_btc_markets(
         source=source,
         horizon=horizon,
@@ -814,15 +921,18 @@ def run_once(
         for m in markets:
             yes_fair, _ = compute_fair_value_for_market(m, snapshot)
             strike      = _extract_strike_price(m.question)
+            t_years     = _time_to_resolution_years(m.end_date)
+            horizon_str = f"{t_years:.2f}y" if t_years else "?y"
             logger.info(
-                "  %-65s  YES mkt=%.3f fair=%.3f  strike=$%s",
-                m.question[:65],
+                "  %-60s  YES mkt=%.3f fair=%.3f  strike=$%s  T=%s",
+                m.question[:60],
                 m.yes_price,
                 yes_fair,
                 f"{strike:,.0f}" if strike else "?",
+                horizon_str,
             )
 
-    # -- Step 4: Detect and place (respecting max_orders cap) ------------------
+    # Step 4: Detect and place
     orders_placed = 0
     for market in markets:
         if orders_placed >= max_orders:
@@ -862,26 +972,12 @@ def run_loop(
     horizon: str    = "all",
     min_liquidity_usd: float = DEFAULT_MIN_LIQUIDITY_USD,
 ) -> None:
-    """
-    Run the maker bot continuously on a fixed interval.
-
-    Never crashes -- all per-cycle exceptions are caught and logged.
-
-    Args:
-        interval: Seconds between cycles.
-        dry_run: If True, do not place real orders.
-        max_size: Maximum order size per trade in USD.
-        min_edge: Minimum required edge to place an order.
-        verbose: If True, log detailed signal and market information.
-        source: 'clob' | 'gamma' | 'all'.
-        horizon: 'weekly' | 'monthly' | 'all' (Gamma only).
-        min_liquidity_usd: Minimum liquidity filter for Gamma results.
-    """
+    """Run the maker bot continuously on a fixed interval."""
     logger.info(
         "Maker bot starting | mode=%s | interval=%ds | max_size=$%.2f | "
-        "min_edge=%.3f | source=%s | horizon=%s | min_liq=$%.0f",
+        "min_edge=%.3f | source=%s | horizon=%s | min_liq=$%.0f | sigma=%.2f",
         "DRY RUN" if dry_run else "LIVE", interval, max_size, min_edge,
-        source, horizon, min_liquidity_usd,
+        source, horizon, min_liquidity_usd, GBM_VOL_ANNUAL,
     )
     cycle = 0
     while True:
