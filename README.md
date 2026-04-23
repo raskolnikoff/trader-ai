@@ -149,8 +149,6 @@ cd dashboard && python -m http.server 8080
 
 Shows: BTC price + 5m delta (from Binance), wallet balance, positions, markets scan (fair vs market price + edge), recent alerts, and an optional TradingView chart snapshot when TV Desktop is running in debug mode.
 
-![Dashboard](docs/architecture.svg)
-
 ---
 
 ## TradingView alerts (optional, Pro+ plan)
