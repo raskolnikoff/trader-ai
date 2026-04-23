@@ -1,0 +1,79 @@
+// @version=5
+// @description Polymarket Overlay — research-only reference indicator.
+//
+// This Pine Script is a reference for Pro+ plan TradingView users who want
+// to send alerts to the trader-ai webhook server.
+//
+// It is NOT required by the trader-ai maker bot. The bot runs completely
+// independently from TradingView (Binance + Polymarket only).
+//
+// Intended usage:
+//   1. Paste this script into TradingView's Pine Editor.
+//   2. Add to any BTCUSDT / BTCUSD chart.
+//   3. Right-click the chart → Add alert.
+//   4. In the alert's Message field, paste the JSON template from
+//      docs/webhook_setup.md (with your secret substituted in).
+//   5. Set the Webhook URL to your ngrok public URL + "/webhook".
+//
+// ToS note: this indicator is user-installed by you into your own TradingView
+// account. It runs on TradingView's servers, not on our machines. All we do
+// is receive the alert body over HTTPS when the condition fires. No scraping,
+// no reverse engineering, no data extraction from TradingView.
+//
+// License: MIT. Modify freely.
+
+indicator("Polymarket Overlay (trader-ai)", overlay=true, max_labels_count=50)
+
+// -- Inputs --------------------------------------------------------------------
+
+momentumLookback = input.int(12,  "Momentum lookback (bars)", minval=2, maxval=200)
+edgeStrikeTrig   = input.float(1.5, "Breakout threshold (% in lookback)", step=0.1)
+showLabels       = input.bool(true, "Draw labels on triggers")
+
+// -- Logic ---------------------------------------------------------------------
+
+// Rolling % change over the lookback window
+priceNow    = close
+priceBack   = close[momentumLookback]
+pctChange   = (priceNow - priceBack) / priceBack * 100
+
+// Direction detection
+momentumUp   = pctChange >=  edgeStrikeTrig
+momentumDown = pctChange <= -edgeStrikeTrig
+
+// -- Plot ---------------------------------------------------------------------
+
+// Subtle background tint during momentum regime
+bgcolor(momentumUp   ? color.new(color.lime,  92) : na)
+bgcolor(momentumDown ? color.new(color.red,   92) : na)
+
+plot(close, title="Close", color=color.new(color.gray, 50))
+
+// -- Labels on trigger --------------------------------------------------------
+
+if showLabels and momentumUp and not momentumUp[1]
+    label.new(bar_index, high,
+        text  = "↑ " + str.tostring(pctChange, "#.##") + "%",
+        style = label.style_label_down,
+        color = color.new(color.lime, 20),
+        textcolor = color.black,
+        size  = size.small)
+
+if showLabels and momentumDown and not momentumDown[1]
+    label.new(bar_index, low,
+        text  = "↓ " + str.tostring(pctChange, "#.##") + "%",
+        style = label.style_label_up,
+        color = color.new(color.red, 20),
+        textcolor = color.white,
+        size  = size.small)
+
+// -- Alert condition ---------------------------------------------------------
+
+// When the user creates an alert via the chart UI, they select the condition
+// "Polymarket Overlay (trader-ai): Momentum trigger" and paste the JSON body
+// from docs/webhook_setup.md into the Message field.
+alertcondition(
+    momentumUp or momentumDown,
+    title   = "Momentum trigger",
+    message = "Momentum trigger on {{ticker}} at {{close}}"
+)
