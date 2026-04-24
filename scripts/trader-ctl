@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# trader-ctl -- Unified lifecycle for trader-ai local services.
+#
+# Usage:
+#   ./scripts/trader-ctl up              # start everything
+#   ./scripts/trader-ctl down            # stop everything
+#   ./scripts/trader-ctl status          # show what's running
+#   ./scripts/trader-ctl restart         # down then up
+#   ./scripts/trader-ctl up <service>    # start just one
+#   ./scripts/trader-ctl down <service>  # stop just one
+#   ./scripts/trader-ctl logs <service>  # tail logs for one
+#
+# Services (bring-up order):
+#   tv          TradingView Desktop with CDP on :9222
+#   webhook     tv_overlay_webhook.py on :8765
+#   dashboard   static HTTP on :8080
+#   ngrok       HTTPS tunnel -> :8765 (optional; requires NGROK_AUTHTOKEN)
+#   cron        maker_bot cron entry (every 2 min)
+#
+# Safe to run multiple times. All start paths are idempotent — starting an
+# already-running service is a no-op and prints "already running".
+
+set -euo pipefail
+
+# -- Paths ---------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ENV_FILE="${REPO_ROOT}/.env"
+MAKER_DIR="${REPO_ROOT}/trader-cli/contrib/maker_bot"
+
+LOG_DIR="${HOME}/logs"
+PID_DIR="${HOME}/.trader-ai/pids"
+mkdir -p "${LOG_DIR}" "${PID_DIR}"
+
+TV_PID_FILE="${PID_DIR}/tv.pid"
+WEBHOOK_PID_FILE="${PID_DIR}/webhook.pid"
+DASHBOARD_PID_FILE="${PID_DIR}/dashboard.pid"
+NGROK_PID_FILE="${PID_DIR}/ngrok.pid"
+
+TV_LOG="${LOG_DIR}/tv.log"
+WEBHOOK_LOG="${LOG_DIR}/webhook.log"
+DASHBOARD_LOG="${LOG_DIR}/dashboard.log"
+NGROK_LOG="${LOG_DIR}/ngrok.log"
+MAKER_LOG="${LOG_DIR}/maker_bot.log"
+
+TV_APP="/Applications/TradingView.app/Contents/MacOS/TradingView"
+TV_CDP_PORT="${TV_CDP_PORT:-9222}"
+WEBHOOK_PORT="${WEBHOOK_PORT:-8765}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"
+
+# Lock files the maker_bot cron uses (see cron_setup.sh)
+MAKER_LOCK_FILE="/tmp/maker_bot_trader_ai.lock"
+MAKER_LOCK_DIR="/tmp/maker_bot_trader_ai.lockdir"
+
+CRON_TAG="maker_bot_trader_ai"
+LOGROTATE_TAG="maker_bot_logrotate"
+
+# -- Colors (only when writing to a tty) --------------------------------------
+
+if [ -t 1 ]; then
+    C_DIM="\033[2m"; C_RED="\033[31m"; C_GRN="\033[32m"
+    C_YLW="\033[33m"; C_CYN="\033[36m"; C_RST="\033[0m"
+else
+    C_DIM=""; C_RED=""; C_GRN=""; C_YLW=""; C_CYN=""; C_RST=""
+fi
+
+_ok()   { printf "  ${C_GRN}✓${C_RST} %s\n" "$*"; }
+_no()   { printf "  ${C_DIM}·${C_RST} %s\n" "$*"; }
+_warn() { printf "  ${C_YLW}!${C_RST} %s\n" "$*"; }
+_err()  { printf "  ${C_RED}✗${C_RST} %s\n" "$*" >&2; }
+_head() { printf "${C_CYN}%s${C_RST}\n" "$*"; }
+
+# -- Helpers -------------------------------------------------------------------
+
+_is_running() {
+    # _is_running <pid_file>  -> 0 if pid exists and process alive, else 1.
+    local pid_file="$1"
+    [ -f "${pid_file}" ] || return 1
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || echo "")"
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null
+}
+
+_port_in_use() {
+    # _port_in_use <port>  -> 0 if something is listening, else 1.
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+_stop_pidfile() {
+    # _stop_pidfile <name> <pid_file>
+    local name="$1" pid_file="$2"
+    if _is_running "${pid_file}"; then
+        local pid
+        pid="$(cat "${pid_file}")"
+        kill -TERM "${pid}" 2>/dev/null || true
+        # Wait up to 5s, then SIGKILL
+        for _ in 1 2 3 4 5; do
+            kill -0 "${pid}" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "${pid}" 2>/dev/null; then
+            kill -KILL "${pid}" 2>/dev/null || true
+        fi
+        rm -f "${pid_file}"
+        _ok "${name} stopped (pid ${pid})"
+    else
+        _no "${name} was not running"
+        rm -f "${pid_file}"
+    fi
+}
+
+_source_env_if_present() {
+    if [ -f "${ENV_FILE}" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${ENV_FILE}"
+        set +a
+    fi
+}
+
+# -- tv (TradingView Desktop with CDP) ----------------------------------------
+
+_start_tv() {
+    if _is_running "${TV_PID_FILE}"; then
+        _no "tv already running (pid $(cat "${TV_PID_FILE}"))"
+        return 0
+    fi
+    if _port_in_use "${TV_CDP_PORT}"; then
+        _warn "tv port ${TV_CDP_PORT} already in use — assuming TV is running; skipping launch"
+        return 0
+    fi
+    if [ ! -x "${TV_APP}" ]; then
+        _warn "tv app not found at ${TV_APP}; skipping (install TradingView Desktop or set TV_APP)"
+        return 0
+    fi
+    "${TV_APP}" --remote-debugging-port="${TV_CDP_PORT}" \
+        >> "${TV_LOG}" 2>&1 &
+    local pid=$!
+    echo "${pid}" > "${TV_PID_FILE}"
+    _ok "tv started (pid ${pid}, cdp ${TV_CDP_PORT})"
+}
+
+_stop_tv() {
+    # TV app is a GUI — killing the launcher shell often doesn't kill the app
+    # itself. Use pkill on the bundle name as well.
+    _stop_pidfile "tv" "${TV_PID_FILE}"
+    if pgrep -f "TradingView.app/Contents/MacOS/TradingView" >/dev/null 2>&1; then
+        pkill -TERM -f "TradingView.app/Contents/MacOS/TradingView" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -f "TradingView.app/Contents/MacOS/TradingView" 2>/dev/null || true
+        _ok "tv process killed via pkill"
+    fi
+}
+
+# -- webhook (tv_overlay_webhook.py) ------------------------------------------
+
+_start_webhook() {
+    if _is_running "${WEBHOOK_PID_FILE}"; then
+        _no "webhook already running (pid $(cat "${WEBHOOK_PID_FILE}"))"
+        return 0
+    fi
+    if _port_in_use "${WEBHOOK_PORT}"; then
+        _warn "webhook port ${WEBHOOK_PORT} already in use — skipping"
+        return 0
+    fi
+    (
+        cd "${REPO_ROOT}"
+        set -a
+        # shellcheck disable=SC1090
+        [ -f "${ENV_FILE}" ] && source "${ENV_FILE}"
+        set +a
+        exec python "${MAKER_DIR}/tv_overlay_webhook.py" \
+            >> "${WEBHOOK_LOG}" 2>&1
+    ) &
+    local pid=$!
+    echo "${pid}" > "${WEBHOOK_PID_FILE}"
+    _ok "webhook started (pid ${pid}, port ${WEBHOOK_PORT})"
+}
+
+_stop_webhook() {
+    _stop_pidfile "webhook" "${WEBHOOK_PID_FILE}"
+    # Cover the case where something else started it without the pid file
+    if _port_in_use "${WEBHOOK_PORT}"; then
+        local pid
+        pid="$(lsof -nP -iTCP:"${WEBHOOK_PORT}" -sTCP:LISTEN -t 2>/dev/null | head -n1)"
+        if [ -n "${pid}" ]; then
+            kill -TERM "${pid}" 2>/dev/null || true
+            sleep 1
+            kill -KILL "${pid}" 2>/dev/null || true
+            _ok "webhook orphan on port ${WEBHOOK_PORT} killed (pid ${pid})"
+        fi
+    fi
+}
+
+# -- dashboard (static http server) -------------------------------------------
+
+_start_dashboard() {
+    if _is_running "${DASHBOARD_PID_FILE}"; then
+        _no "dashboard already running (pid $(cat "${DASHBOARD_PID_FILE}"))"
+        return 0
+    fi
+    if _port_in_use "${DASHBOARD_PORT}"; then
+        _warn "dashboard port ${DASHBOARD_PORT} already in use — skipping"
+        return 0
+    fi
+    (
+        cd "${REPO_ROOT}/dashboard"
+        exec python -m http.server "${DASHBOARD_PORT}" \
+            >> "${DASHBOARD_LOG}" 2>&1
+    ) &
+    local pid=$!
+    echo "${pid}" > "${DASHBOARD_PID_FILE}"
+    _ok "dashboard started (pid ${pid}, http://localhost:${DASHBOARD_PORT}/?api=http://localhost:${WEBHOOK_PORT})"
+}
+
+_stop_dashboard() {
+    _stop_pidfile "dashboard" "${DASHBOARD_PID_FILE}"
+    if _port_in_use "${DASHBOARD_PORT}"; then
+        local pid
+        pid="$(lsof -nP -iTCP:"${DASHBOARD_PORT}" -sTCP:LISTEN -t 2>/dev/null | head -n1)"
+        if [ -n "${pid}" ]; then
+            kill -TERM "${pid}" 2>/dev/null || true
+            sleep 1
+            kill -KILL "${pid}" 2>/dev/null || true
+            _ok "dashboard orphan on port ${DASHBOARD_PORT} killed (pid ${pid})"
+        fi
+    fi
+}
+
+# -- ngrok (optional tunnel) --------------------------------------------------
+
+_start_ngrok() {
+    if ! command -v ngrok >/dev/null 2>&1; then
+        _no "ngrok not installed — skipping (install with: brew install ngrok)"
+        return 0
+    fi
+    if _is_running "${NGROK_PID_FILE}"; then
+        _no "ngrok already running (pid $(cat "${NGROK_PID_FILE}"))"
+        return 0
+    fi
+    # Avoid starting ngrok with no webhook to point at
+    if ! _port_in_use "${WEBHOOK_PORT}"; then
+        _warn "webhook not running on ${WEBHOOK_PORT}; start webhook before ngrok"
+        return 0
+    fi
+    _source_env_if_present
+    nohup ngrok http "${WEBHOOK_PORT}" --log=stdout \
+        >> "${NGROK_LOG}" 2>&1 &
+    local pid=$!
+    echo "${pid}" > "${NGROK_PID_FILE}"
+    # Give ngrok 2s to establish, then print the public URL if we can find it
+    sleep 2
+    local url
+    url="$(grep -oE 'https://[a-z0-9.-]+\.ngrok-free\.(app|dev)' "${NGROK_LOG}" \
+            2>/dev/null | tail -n1 || true)"
+    if [ -n "${url}" ]; then
+        _ok "ngrok started (pid ${pid}, ${url} -> :${WEBHOOK_PORT})"
+    else
+        _ok "ngrok started (pid ${pid}); check ${NGROK_LOG} for the URL"
+    fi
+}
+
+_stop_ngrok() {
+    _stop_pidfile "ngrok" "${NGROK_PID_FILE}"
+    if pgrep -f "ngrok http ${WEBHOOK_PORT}" >/dev/null 2>&1; then
+        pkill -TERM -f "ngrok http ${WEBHOOK_PORT}" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -f "ngrok http ${WEBHOOK_PORT}" 2>/dev/null || true
+        _ok "ngrok orphan killed via pkill"
+    fi
+}
+
+# -- cron (maker bot) ---------------------------------------------------------
+
+_start_cron() {
+    if crontab -l 2>/dev/null | grep -q "${CRON_TAG}"; then
+        _no "cron entry already installed"
+        return 0
+    fi
+    if [ -x "${MAKER_DIR}/cron_setup.sh" ]; then
+        # Let cron_setup.sh do the install (it knows about flock detection etc.)
+        "${MAKER_DIR}/cron_setup.sh" install >/dev/null
+        _ok "cron installed (every 2 min; logs -> ${MAKER_LOG})"
+    else
+        _err "${MAKER_DIR}/cron_setup.sh not executable"
+    fi
+}
+
+_stop_cron() {
+    local removed=0
+    if crontab -l 2>/dev/null | grep -qE "${CRON_TAG}|${LOGROTATE_TAG}"; then
+        (crontab -l 2>/dev/null \
+            | grep -v "${CRON_TAG}" \
+            | grep -v "${LOGROTATE_TAG}") \
+            | crontab - || true
+        removed=1
+    fi
+    # Kill any maker_bot.py still in flight
+    if pgrep -f "maker_bot.py" >/dev/null 2>&1; then
+        pkill -TERM -f "maker_bot.py" 2>/dev/null || true
+        sleep 2
+        pkill -KILL -f "maker_bot.py" 2>/dev/null || true
+    fi
+    # Clear locks (both strategies)
+    rm -f "${MAKER_LOCK_FILE}"
+    rmdir "${MAKER_LOCK_DIR}" 2>/dev/null || true
+    if [ "${removed}" -eq 1 ]; then
+        _ok "cron removed; maker_bot processes killed; locks cleared"
+    else
+        _no "cron was not installed"
+    fi
+}
+
+# -- status -------------------------------------------------------------------
+
+_status_one() {
+    # _status_one <label> <pid_file> <port_or_empty>
+    local label="$1" pid_file="$2" port="${3:-}"
+    if _is_running "${pid_file}"; then
+        printf "  ${C_GRN}●${C_RST} %-10s running (pid %s)" "${label}" "$(cat "${pid_file}")"
+        if [ -n "${port}" ]; then
+            printf "  :%s" "${port}"
+        fi
+        printf "\n"
+    elif [ -n "${port}" ] && _port_in_use "${port}"; then
+        printf "  ${C_YLW}●${C_RST} %-10s port :%s in use (no pid file)\n" "${label}" "${port}"
+    else
+        printf "  ${C_DIM}○${C_RST} %-10s stopped\n" "${label}"
+    fi
+}
+
+_status_cron() {
+    if crontab -l 2>/dev/null | grep -q "${CRON_TAG}"; then
+        printf "  ${C_GRN}●${C_RST} %-10s installed (every 2 min)\n" "cron"
+    else
+        printf "  ${C_DIM}○${C_RST} %-10s not installed\n" "cron"
+    fi
+    if [ -f "${MAKER_LOG}" ]; then
+        local last_line age_s
+        last_line="$(tail -n1 "${MAKER_LOG}" 2>/dev/null || true)"
+        age_s=$(( $(date +%s) - $(stat -f %m "${MAKER_LOG}" 2>/dev/null \
+                  || stat -c %Y "${MAKER_LOG}" 2>/dev/null || echo 0) ))
+        printf "  ${C_DIM}  last log: %ds ago  [%s]${C_RST}\n" \
+            "${age_s}" "${last_line:0:80}"
+    fi
+}
+
+_cmd_status() {
+    _head "trader-ai services:"
+    _status_one "tv"        "${TV_PID_FILE}"        "${TV_CDP_PORT}"
+    _status_one "webhook"   "${WEBHOOK_PID_FILE}"   "${WEBHOOK_PORT}"
+    _status_one "dashboard" "${DASHBOARD_PID_FILE}" "${DASHBOARD_PORT}"
+    _status_one "ngrok"     "${NGROK_PID_FILE}"     ""
+    _status_cron
+    echo ""
+    printf "${C_DIM}logs:  ${LOG_DIR}/{tv,webhook,dashboard,ngrok,maker_bot}.log${C_RST}\n"
+    printf "${C_DIM}pids:  ${PID_DIR}/${C_RST}\n"
+}
+
+# -- top-level dispatch -------------------------------------------------------
+
+_cmd_up() {
+    local svc="${1:-all}"
+    case "${svc}" in
+        all)
+            _head "Starting all services..."
+            _start_tv
+            _start_webhook
+            _start_dashboard
+            _start_ngrok
+            _start_cron
+            echo ""
+            _cmd_status
+            ;;
+        tv)        _start_tv ;;
+        webhook)   _start_webhook ;;
+        dashboard) _start_dashboard ;;
+        ngrok)     _start_ngrok ;;
+        cron)      _start_cron ;;
+        *) _err "unknown service: ${svc}"; exit 1 ;;
+    esac
+}
+
+_cmd_down() {
+    local svc="${1:-all}"
+    case "${svc}" in
+        all)
+            _head "Stopping all services..."
+            # Reverse order of up
+            _stop_cron
+            _stop_ngrok
+            _stop_dashboard
+            _stop_webhook
+            _stop_tv
+            echo ""
+            _cmd_status
+            ;;
+        tv)        _stop_tv ;;
+        webhook)   _stop_webhook ;;
+        dashboard) _stop_dashboard ;;
+        ngrok)     _stop_ngrok ;;
+        cron)      _stop_cron ;;
+        *) _err "unknown service: ${svc}"; exit 1 ;;
+    esac
+}
+
+_cmd_logs() {
+    local svc="${1:-}"
+    case "${svc}" in
+        tv)        tail -f "${TV_LOG}" ;;
+        webhook)   tail -f "${WEBHOOK_LOG}" ;;
+        dashboard) tail -f "${DASHBOARD_LOG}" ;;
+        ngrok)     tail -f "${NGROK_LOG}" ;;
+        cron|maker|maker_bot) tail -f "${MAKER_LOG}" ;;
+        "")
+            _err "logs: specify a service (tv, webhook, dashboard, ngrok, cron)"
+            exit 1
+            ;;
+        *) _err "unknown service: ${svc}"; exit 1 ;;
+    esac
+}
+
+_usage() {
+    cat <<EOF
+trader-ctl -- unified lifecycle for trader-ai local services
+
+Usage:
+  $0 up [service]      Start everything (or one service)
+  $0 down [service]    Stop everything (or one service)
+  $0 restart [service] down + up
+  $0 status            Show what's running
+  $0 logs <service>    tail -f the log for one service
+
+Services:
+  tv         TradingView Desktop with CDP on :${TV_CDP_PORT}
+  webhook    tv_overlay_webhook.py on :${WEBHOOK_PORT}
+  dashboard  dashboard static HTTP on :${DASHBOARD_PORT}
+             (open http://localhost:${DASHBOARD_PORT}/?api=http://localhost:${WEBHOOK_PORT})
+  ngrok      tunnel -> :${WEBHOOK_PORT} (optional)
+  cron       maker_bot cron entry (every 2 min)
+
+Env overrides:
+  TV_CDP_PORT, WEBHOOK_PORT, DASHBOARD_PORT
+
+Examples:
+  $0 up                # everything
+  $0 down cron         # pause the bot, leave dashboard up
+  $0 restart webhook   # bounce webhook only
+  $0 logs webhook      # tail webhook log
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "${cmd}" in
+        up)      _cmd_up      "${1:-all}" ;;
+        down)    _cmd_down    "${1:-all}" ;;
+        restart)
+            _cmd_down "${1:-all}"
+            echo ""
+            _cmd_up   "${1:-all}"
+            ;;
+        status)  _cmd_status ;;
+        logs)    _cmd_logs   "${1:-}" ;;
+        -h|--help|help|"") _usage ;;
+        *) _err "unknown command: ${cmd}"; _usage; exit 1 ;;
+    esac
+}
+
+main "$@"
